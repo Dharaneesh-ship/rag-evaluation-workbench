@@ -623,7 +623,10 @@ class IngestPipeline:
             for c in chunks
         ]
 
-        # 9. Embed + index (optional)
+        # 9. Embed (optional) + index
+        # Keyword (BM25) indexing needs no vectors, so it must not be gated on
+        # embedding_provider — BM25-only mode (embedding_provider=None) is a
+        # supported configuration and must still populate the keyword index.
         embed_tokens = 0
         if self._embedding_provider is not None and chunks:
             texts = [c.stable_text for c in chunks]
@@ -648,11 +651,11 @@ class IngestPipeline:
                 "Embedded %d chunks using %d tokens.", len(chunks), embed_tokens
             )
 
-            if self._keyword_index is not None:
-                self._keyword_index.add(chunks)
-
             if self._vector_index is not None:
                 self._vector_index.add(chunks)
+
+        if self._keyword_index is not None and chunks:
+            self._keyword_index.add(chunks)
 
         self._doc_store.save_chunks(chunks)
 

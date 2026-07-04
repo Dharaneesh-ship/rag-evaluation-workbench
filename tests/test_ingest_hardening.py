@@ -372,6 +372,73 @@ class TestIngestStatus:
 
 
 # ---------------------------------------------------------------------------
+# Keyword (BM25) index population must not depend on an embedding provider
+# ---------------------------------------------------------------------------
+
+
+class TestKeywordIndexIndependentOfEmbedding:
+    """BM25-only ingest (embedding_provider=None) is a supported, documented
+    configuration (Studio's "none" option) and must populate the keyword
+    index like any other run — it must not silently no-op."""
+
+    def test_bm25_only_ingest_populates_keyword_index(self, tmp_path):
+        from rag.infra.indexes.bm25_local import BM25LocalIndex
+        from rag.infra.stores.docstore_sqlite import SQLiteDocStore
+        from rag.infra.stores.tracestore_sqlite import SQLiteTraceStore
+        from rag.pipelines.ingest_pipeline import IngestPipeline
+
+        db = tmp_path / "test.db"
+        keyword_index = BM25LocalIndex()
+        pipeline = IngestPipeline(
+            SQLiteDocStore(db),
+            SQLiteTraceStore(db),
+            keyword_index=keyword_index,
+            embedding_provider=None,
+        )
+        f = tmp_path / "doc.md"
+        f.write_text("# Title\n\nContent about cats and dogs with enough words.")
+
+        result = pipeline.ingest(f)
+
+        assert result.status == "ok"
+        assert len(keyword_index._chunks) == result.chunk_count > 0
+        assert keyword_index.search("cats and dogs", top_k=5)
+
+    def test_keyword_index_populated_alongside_vector_index(self, tmp_path):
+        # Both indexes must end up populated when an embedding_provider IS
+        # supplied — guards against a regression that re-couples the two.
+        from rag.infra.indexes.bm25_local import BM25LocalIndex
+        from rag.infra.stores.docstore_sqlite import SQLiteDocStore
+        from rag.infra.stores.tracestore_sqlite import SQLiteTraceStore
+        from rag.pipelines.ingest_pipeline import IngestPipeline
+
+        db = tmp_path / "test.db"
+        keyword_index = BM25LocalIndex()
+        vector_index = MagicMock()
+        embedding_provider = MagicMock()
+        embedding_provider.embed.return_value = MagicMock(prompt_tokens=10)
+        embedding_provider.embed_with_usage.return_value = MagicMock(
+            vectors=[[0.1, 0.2]], prompt_tokens=10
+        )
+
+        pipeline = IngestPipeline(
+            SQLiteDocStore(db),
+            SQLiteTraceStore(db),
+            keyword_index=keyword_index,
+            vector_index=vector_index,
+            embedding_provider=embedding_provider,
+        )
+        f = tmp_path / "doc.md"
+        f.write_text("# Title\n\nContent about cats and dogs with enough words.")
+
+        result = pipeline.ingest(f)
+
+        assert result.status == "ok"
+        assert len(keyword_index._chunks) == result.chunk_count
+        vector_index.add.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
 # Batch ingest report
 # ---------------------------------------------------------------------------
 
