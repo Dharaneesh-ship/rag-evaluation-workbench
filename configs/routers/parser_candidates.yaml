@@ -11,11 +11,35 @@ ocr:
   # and will trigger OCR fallback after the primary text parser runs.
   min_chars_threshold: 100
 
+vision:
+  # Set to false to disable the vision-LLM escalation tier entirely
+  # (e.g. to avoid API costs). Requires OPENAI_API_KEY at runtime.
+  enabled: true
+  # OCR results with mean confidence below this escalate to pdf_vision.
+  min_ocr_confidence: 0.6
+  # Page-level escalation (pdf_hybrid): text-rich PDFs whose charts and
+  # multi-column pages would otherwise be mangled or silently dropped.
+  page_level:
+    enabled: true
+    # Hard cap on vision-parsed pages per document (API cost bound).
+    max_pages_per_doc: 30
+    # A page escalates when ANY of these triggers fire:
+    image_area_ratio: 0.15      # raster images cover >= 15% of the page
+    min_vector_drawings: 25     # native vector charts/graphs (path count)
+    drawing_area_ratio: 0.10    # vector drawings cover >= 10% of the page
+    min_chars_per_page: 200     # image-only / sparse-text pages
+
 routes:
   pdf:
-    # pymupdf is tried first; if it produces too few chars (scanned PDF),
-    # the orchestrator falls back to pdf_ocr when ocr.enabled is true.
-    candidates: [pymupdf, pdf_ocr]
+    # Fallback chain, ordered by cost:
+    #   1. pdf_hybrid — pymupdf text + per-page vision for complex pages
+    #                   (registered only when OPENAI_API_KEY is available)
+    #   2. pymupdf    — free, digital-text PDFs
+    #   3. pdf_ocr    — local OCR, triggered when the text tier yields too
+    #                   few chars (scanned PDF)
+    #   4. pdf_vision — full-document vision LLM, triggered when OCR output
+    #                   is near-empty or below min_ocr_confidence
+    candidates: [pdf_hybrid, pymupdf, pdf_ocr, pdf_vision]
 
   html:
     candidates: [trafilatura]

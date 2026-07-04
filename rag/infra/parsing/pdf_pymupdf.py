@@ -44,10 +44,32 @@ _MIN_BLOCK_CHARS = 3
 # A line is a heading when its dominant font size >= median * this ratio.
 _HEADING_FONT_RATIO = 1.2
 
+# Font-size headings must be short. Slide-style PDFs render body text in
+# large fonts (the tiny disclaimer text drags the document median down),
+# so long large-font lines are body text, not titles.
+_HEADING_MAX_CHARS = 80
+
+# Font-size headings must not end like a running sentence. Wrapped body
+# lines end with these; real titles almost never do.
+_SENTENCE_ENDINGS = (".", ",", ";")
+
+# Page-level demotion: when a page classifies this many (or more) of its
+# blocks as font-size headings AND they are the majority, the font-size
+# signal is considered broken for that page and those headings are demoted
+# back to paragraphs. ALL-CAPS headings are kept.
+_DEMOTE_MIN_HEADINGS = 5
+_DEMOTE_FRACTION = 0.5
+
 # ALL-CAPS heading pattern: entire line is uppercase letters, spaces, and a
 # small set of punctuation characters.  Min 4 chars to skip abbreviations like
 # "NC" or "VA"; max 60 chars to skip sentences accidentally typed in caps.
 _ALLCAPS_HEADING_RE = re.compile(r"^[A-Z][A-Z\s&/\-]{3,59}$")
+
+# Invisible/zero-width characters that PDFs embed in extracted text. They
+# defeat string checks (e.g. a zero-width space after a period hides the
+# sentence ending) and pollute stored block text.
+# U+200B ZWSP, U+200C ZWNJ, U+200D ZWJ, U+2060 WORD JOINER, U+FEFF BOM
+_INVISIBLE_CHARS_RE = re.compile("[\\u200b\\u200c\\u200d\\u2060\\ufeff]")
 
 
 # ── Font-size helpers ─────────────────────────────────────────────────────────
@@ -125,15 +147,19 @@ def _line_dominant_font_size(line: dict) -> float:
 
 
 def _line_text(line: dict) -> str:
-    """Concatenate all span texts in a line."""
-    return "".join(span.get("text", "") for span in line.get("spans", []))
+    """Concatenate all span texts in a line, stripping invisible characters."""
+    raw = "".join(span.get("text", "") for span in line.get("spans", []))
+    return _INVISIBLE_CHARS_RE.sub("", raw)
 
 
-def _is_heading_line(text: str, dom_size: float, heading_threshold: float) -> bool:
-    """Return True if a line should be classified as a heading.
+def _heading_signal(text: str, dom_size: float, heading_threshold: float) -> str | None:
+    """Classify a line as a heading and report which signal fired.
 
     Two independent signals:
-    1. Font-size: dominant size >= heading_threshold (document median * ratio).
+    1. Font-size: dominant size >= heading_threshold (document median * ratio),
+       AND the line is short and does not end like a running sentence —
+       slide-style PDFs render body text in large fonts, so long large-font
+       lines are body content, not titles.
     2. ALL-CAPS pattern: entire line matches ``_ALLCAPS_HEADING_RE``.
 
     Args:
@@ -142,15 +168,59 @@ def _is_heading_line(text: str, dom_size: float, heading_threshold: float) -> bo
         heading_threshold: Font-size cutoff (median * _HEADING_FONT_RATIO).
 
     Returns:
-        True if the line is a heading by either signal.
+        ``"font"`` or ``"caps"`` when the line is a heading, None otherwise.
     """
     if not text:
-        return False
-    if dom_size > 0 and dom_size >= heading_threshold:
-        return True
+        return None
+    if (
+        dom_size > 0
+        and dom_size >= heading_threshold
+        and len(text) <= _HEADING_MAX_CHARS
+        and not text.endswith(_SENTENCE_ENDINGS)
+        and not text[0].islower()  # wrapped sentence fragments start lowercase
+    ):
+        return "font"
     if _ALLCAPS_HEADING_RE.match(text):
-        return True
-    return False
+        return "caps"
+    return None
+
+
+def _demote_heading_floods(blocks: list[IRBlock], font_heading_ids: set[int]) -> None:
+    """Demote font-size headings on pages where they form the majority.
+
+    When most blocks on a page classify as font-size headings, the document
+    median font size is not representative for that page (typical for slide
+    decks with small-print disclaimers) and the signal is considered broken:
+    those headings are converted back to paragraphs in place. ALL-CAPS
+    headings are unaffected.
+
+    Args:
+        blocks: All parsed IRBlocks (mutated in place).
+        font_heading_ids: ``id()`` values of blocks classified as headings
+            by the font-size signal.
+    """
+    by_page: dict[int, list[int]] = {}
+    for i, block in enumerate(blocks):
+        if block.page is not None:
+            by_page.setdefault(block.page, []).append(i)
+
+    for page, indices in by_page.items():
+        font_headings = [i for i in indices if id(blocks[i]) in font_heading_ids]
+        if (
+            len(font_headings) >= _DEMOTE_MIN_HEADINGS
+            and len(font_headings) / len(indices) > _DEMOTE_FRACTION
+        ):
+            logger.debug(
+                "Page %d: %d/%d blocks are font-size headings — demoting to "
+                "paragraphs (median font size not representative).",
+                page,
+                len(font_headings),
+                len(indices),
+            )
+            for i in font_headings:
+                blocks[i] = blocks[i].model_copy(
+                    update={"block_type": BlockType.PARAGRAPH}
+                )
 
 
 # ── Quality metrics ───────────────────────────────────────────────────────────
@@ -230,6 +300,7 @@ class PdfPyMuPDFParser(BaseParser):
             raise ValueError(f"Cannot open PDF '{source_path}': {exc}") from exc
 
         blocks: list[IRBlock] = []
+        font_heading_ids: set[int] = set()
 
         try:
             # ── Pass 1: compute document-wide median font size ─────────────
@@ -270,11 +341,11 @@ class PdfPyMuPDFParser(BaseParser):
                             continue
 
                         dom_size = _line_dominant_font_size(line)
-                        is_heading = _is_heading_line(
+                        signal = _heading_signal(
                             line_stripped, dom_size, heading_threshold
                         )
 
-                        if is_heading:
+                        if signal is not None:
                             # Flush any accumulated paragraph content first
                             if pending_para_lines:
                                 para_text = "\n".join(pending_para_lines).strip()
@@ -291,18 +362,19 @@ class PdfPyMuPDFParser(BaseParser):
                             # Emit heading as its own IRBlock
                             if len(line_stripped) >= _MIN_BLOCK_CHARS:
                                 logger.debug(
-                                    "Heading detected (%.1fpt, caps=%s): %r",
+                                    "Heading detected (%.1fpt, signal=%s): %r",
                                     dom_size,
-                                    bool(_ALLCAPS_HEADING_RE.match(line_stripped)),
+                                    signal,
                                     line_stripped[:60],
                                 )
-                                blocks.append(
-                                    IRBlock(
-                                        block_type=BlockType.HEADING,
-                                        text=line_stripped,
-                                        page=page_number,
-                                    )
+                                heading_block = IRBlock(
+                                    block_type=BlockType.HEADING,
+                                    text=line_stripped,
+                                    page=page_number,
                                 )
+                                blocks.append(heading_block)
+                                if signal == "font":
+                                    font_heading_ids.add(id(heading_block))
                         else:
                             pending_para_lines.append(line_raw)
 
@@ -319,6 +391,9 @@ class PdfPyMuPDFParser(BaseParser):
                             )
         finally:
             pdf.close()
+
+        # ── Pass 3: demote heading floods on slide-style pages ──────────
+        _demote_heading_floods(blocks, font_heading_ids)
 
         all_text = " ".join(b.text for b in blocks)
         char_count = len(all_text)
