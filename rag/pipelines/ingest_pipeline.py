@@ -14,6 +14,7 @@ except ImportError:  # pragma: no cover
 from rag.core.interfaces.doc_store import BaseDocStore
 from rag.core.interfaces.embedding import BaseEmbeddingProvider
 from rag.core.interfaces.keyword_index import BaseKeywordIndex
+from rag.core.interfaces.ocr_provider import BaseOCRProvider
 from rag.core.interfaces.trace_store import BaseTraceStore
 from rag.core.interfaces.vector_index import BaseVectorIndex
 from rag.core.utils.hashing import BlockDiffResult, diff_blocks, fingerprint_bytes, make_doc_id
@@ -33,6 +34,144 @@ from rag.pipelines.parsing.quality_gates import QualityGateChecker
 logger = logging.getLogger(__name__)
 
 
+class _LazyOCRProvider(BaseOCRProvider):
+    """Defers PaddleOCR engine construction until the first ``ocr()`` call.
+
+    Loading the PaddleOCR models takes seconds and hundreds of MB of RAM;
+    most ingest runs never hit the OCR tier, so the engine must not be
+    built eagerly in the IngestPipeline constructor.
+    """
+
+    def __init__(self, lang: str = "en") -> None:
+        self._lang = lang
+        self._provider = None
+
+    def ocr(self, image):
+        if self._provider is None:
+            from rag.infra.ocr.paddleocr_provider import PaddleOCRProvider
+
+            self._provider = PaddleOCRProvider(lang=self._lang)
+        return self._provider.ocr(image)
+
+
+def _build_ocr_parser():
+    """Build the pdf_ocr fallback parser if OCR dependencies are installed.
+
+    Dependency presence is checked without importing (importing paddle is
+    slow); the OCR engine itself is loaded lazily on first use.
+
+    Returns:
+        A configured ``PdfOCRParser``, or None when paddleocr/pymupdf/PIL
+        are unavailable in this environment.
+    """
+    import importlib.util
+
+    missing = [
+        name
+        for name in ("paddleocr", "fitz", "PIL")
+        if importlib.util.find_spec(name) is None
+    ]
+    if missing:
+        logger.info(
+            "OCR fallback unavailable (pdf_ocr not registered): "
+            "missing package(s): %s",
+            ", ".join(missing),
+        )
+        return None
+
+    from rag.infra.ocr.renderer_pymupdf import PyMuPDFPageRenderer
+    from rag.infra.parsing.pdf_ocr_parser import PdfOCRParser
+
+    return PdfOCRParser(
+        renderer=PyMuPDFPageRenderer(dpi=150),
+        ocr_provider=_LazyOCRProvider(lang="en"),
+    )
+
+
+def _build_vision_parser(vision_model: str = "gpt-4o-mini"):
+    """Build the pdf_vision escalation parser if an OpenAI key is configured.
+
+    Args:
+        vision_model: OpenAI vision-capable model id used for both the
+            full-document (pdf_vision) and per-page (pdf_hybrid) tiers.
+            Defaults to ``"gpt-4o-mini"``.
+
+    Returns:
+        A configured ``PdfVisionParser``, or None when the openai package
+        or the OPENAI_API_KEY environment variable is missing.
+    """
+    import os
+
+    if not os.environ.get("OPENAI_API_KEY"):
+        logger.info(
+            "Vision fallback unavailable (pdf_vision not registered): "
+            "OPENAI_API_KEY is not set."
+        )
+        return None
+    try:
+        from rag.infra.ocr.renderer_pymupdf import PyMuPDFPageRenderer
+        from rag.infra.parsing.pdf_vision_parser import PdfVisionParser
+
+        return PdfVisionParser(
+            renderer=PyMuPDFPageRenderer(dpi=150), model=vision_model
+        )
+    except ImportError as exc:
+        logger.info(
+            "Vision fallback unavailable (pdf_vision not registered): %s", exc
+        )
+        return None
+
+
+def _build_hybrid_parser(text_parser, vision_parser, router_config_path):
+    """Build the pdf_hybrid page-level escalation parser from router config.
+
+    Args:
+        text_parser: The registered PdfPyMuPDFParser instance.
+        vision_parser: The registered PdfVisionParser instance.
+        router_config_path: Explicit parser_candidates.yaml path, or None
+            for the default project config.
+
+    Returns:
+        A configured ``PdfHybridParser``, or None when page-level escalation
+        is disabled in config.
+    """
+    if _yaml is None:
+        return None
+
+    config_path = router_config_path
+    if config_path is None:
+        for parent in Path(__file__).resolve().parents:
+            candidate = parent / "configs" / "routers" / "parser_candidates.yaml"
+            if candidate.exists():
+                config_path = candidate
+                break
+    if config_path is None or not Path(config_path).exists():
+        return None
+
+    try:
+        data = _yaml.safe_load(Path(config_path).read_text()) or {}
+    except Exception as exc:  # pragma: no cover
+        logger.warning("Failed to load parser config '%s': %s", config_path, exc)
+        return None
+
+    page_cfg = (data.get("vision") or {}).get("page_level") or {}
+    if not page_cfg.get("enabled", True):
+        logger.info("Page-level vision escalation disabled in config.")
+        return None
+
+    from rag.infra.parsing.pdf_hybrid_parser import PdfHybridParser
+
+    return PdfHybridParser(
+        text_parser=text_parser,
+        vision_parser=vision_parser,
+        image_area_ratio=float(page_cfg.get("image_area_ratio", 0.15)),
+        min_vector_drawings=int(page_cfg.get("min_vector_drawings", 25)),
+        min_drawing_area_ratio=float(page_cfg.get("drawing_area_ratio", 0.10)),
+        min_chars_per_page=int(page_cfg.get("min_chars_per_page", 200)),
+        max_vision_pages=int(page_cfg.get("max_pages_per_doc", 30)),
+    )
+
+
 @dataclass
 class IngestResult:
     """Summary of a completed ingest run.
@@ -46,6 +185,15 @@ class IngestResult:
         elapsed_ms: Total wall-clock time in milliseconds.
         skipped: True if the document was already up-to-date and skipped.
         error: Error message if ingestion failed, or None on success.
+        status: Explicit outcome of the run. One of:
+            - ``"ok"``: ingested and indexed normally.
+            - ``"skipped"``: unchanged document, nothing to do.
+            - ``"unsupported"``: format not recognised — NOT stored/indexed.
+            - ``"quality_failed"``: ingested, but the parse failed one or
+              more quality gates (content may be degraded).
+            - ``"empty_content"``: parsed successfully but produced zero
+              chunks — the document is invisible to retrieval.
+            - ``"failed"``: an exception aborted the run (see ``error``).
     """
 
     doc_id: str
@@ -57,6 +205,7 @@ class IngestResult:
     embed_tokens: int = 0
     skipped: bool = False
     error: str | None = None
+    status: str = "ok"
     # Block diff stats — populated when a previous version exists (Task 11.2)
     blocks_added: int = 0
     blocks_removed: int = 0
@@ -98,6 +247,8 @@ class IngestPipeline:
         router_config_path: Path to parser_candidates.yaml. None = auto-detect.
         quality_gate_config_path: Path to quality_gates.yaml. None = auto-detect.
         anchor_config_path: Path to anchors.yaml. None = auto-detect.
+        vision_model: OpenAI vision-capable model id for the pdf_vision and
+            pdf_hybrid parser tiers. Defaults to ``"gpt-4o-mini"``.
     """
 
     # Default guardrail thresholds (used when no config file is found)
@@ -118,6 +269,7 @@ class IngestPipeline:
         anchor_config_path: str | Path | None = None,
         resync_config_path: str | Path | None = None,
         index_dir: str | Path | None = None,
+        vision_model: str = "gpt-4o-mini",
     ) -> None:
         self._doc_store = doc_store
         self._trace_store = trace_store
@@ -136,6 +288,24 @@ class IngestPipeline:
             "docx_parser": DocxParser(),
             "xlsx_parser": XlsxParser(),
         }
+
+        # Optional fallback parsers — registered only when their runtime
+        # dependencies are installed/configured. The orchestrator skips
+        # unregistered candidates, so absence degrades gracefully.
+        ocr_parser = _build_ocr_parser()
+        if ocr_parser is not None:
+            parser_registry["pdf_ocr"] = ocr_parser
+
+        vision_parser = _build_vision_parser(vision_model=vision_model)
+        if vision_parser is not None:
+            parser_registry["pdf_vision"] = vision_parser
+
+            hybrid_parser = _build_hybrid_parser(
+                parser_registry["pymupdf"], vision_parser, router_config_path
+            )
+            if hybrid_parser is not None:
+                parser_registry["pdf_hybrid"] = hybrid_parser
+
         self._orchestrator = ParserOrchestrator(
             parser_registry, router_config_path=router_config_path
         )
@@ -289,6 +459,7 @@ class IngestPipeline:
                 source_path=canonical,
                 run_id=run_id,
                 error=str(exc),
+                status="failed",
             )
 
         result.elapsed_ms = (time.monotonic() - start) * 1000
@@ -303,6 +474,7 @@ class IngestPipeline:
                 "embed_tokens": result.embed_tokens,
                 "elapsed_ms": result.elapsed_ms,
                 "error": result.error,
+                "status": result.status,
             },
         )
         return result
@@ -347,6 +519,7 @@ class IngestPipeline:
                 source_path=canonical,
                 run_id=run_id,
                 skipped=True,
+                status="skipped",
             )
 
         # 2. Sniff
@@ -357,10 +530,30 @@ class IngestPipeline:
         plan = self._orchestrator.route(sniff_result)
         document = self._orchestrator.parse(artifact, plan)
 
+        # 3b. Unsupported format — refuse to store the placeholder document.
+        # Indexing "[unsupported_format: ...]" text would pollute retrieval
+        # while looking like a successful ingest.
+        if document.metadata.get("unsupported_format"):
+            detected = document.metadata.get("detected_type", "unknown")
+            logger.warning(
+                "Refusing to ingest '%s': unsupported format '%s'.",
+                canonical,
+                detected,
+            )
+            return IngestResult(
+                doc_id=doc_id,
+                source_path=canonical,
+                run_id=run_id,
+                error=f"unsupported format: {detected}",
+                status="unsupported",
+            )
+
         # 4. Quality gate
+        status = "ok"
         if document.parse_report:
             gate_result = self._quality_gate.check(document.parse_report)
             if not gate_result.passed:
+                status = "quality_failed"
                 logger.warning(
                     "Quality gate failed for '%s': %s",
                     source_path,
@@ -514,6 +707,27 @@ class IngestPipeline:
             run_id,
         )
 
+        # Empty content trumps a quality-gate warning: zero chunks means
+        # retrieval can never find this document. Remove it from the store
+        # so a later re-ingest (e.g. after installing OCR or fixing the
+        # source file) processes it again instead of being skipped as
+        # "unchanged".
+        if not chunks:
+            status = "empty_content"
+            logger.warning(
+                "Document '%s' produced 0 chunks — it will be invisible "
+                "to retrieval (parser=%s). Removing it from the store so "
+                "a future ingest can retry.",
+                canonical,
+                document.parse_report.parser_used if document.parse_report else "?",
+            )
+            try:
+                self._doc_store.delete_document(doc_id)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to remove empty document '%s': %s", doc_id, exc
+                )
+
         return IngestResult(
             doc_id=doc_id,
             source_path=source_path,
@@ -522,6 +736,7 @@ class IngestPipeline:
             run_id=run_id,
             embed_tokens=embed_tokens,
             skipped=False,
+            status=status,
             blocks_added=block_diff.added_count if block_diff else 0,
             blocks_removed=block_diff.removed_count if block_diff else 0,
             blocks_unchanged=block_diff.unchanged_count if block_diff else 0,

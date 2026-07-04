@@ -17,6 +17,11 @@ _CHAR_MAP: dict[str, str] = {
     "\u2026": "...", # HORIZONTAL ELLIPSIS
     "\u00a0": " ",   # NO-BREAK SPACE
     "\u00ad": "",    # SOFT HYPHEN (remove)
+    "\u200b": "",    # ZERO WIDTH SPACE (remove)
+    "\u200c": "",    # ZERO WIDTH NON-JOINER (remove)
+    "\u200d": "",    # ZERO WIDTH JOINER (remove)
+    "\u2060": "",    # WORD JOINER (remove)
+    "\ufeff": "",    # ZERO WIDTH NO-BREAK SPACE / BOM (remove)
     "\ufb01": "fi",  # LATIN SMALL LIGATURE FI
     "\ufb02": "fl",  # LATIN SMALL LIGATURE FL
     "\ufb00": "ff",  # LATIN SMALL LIGATURE FF

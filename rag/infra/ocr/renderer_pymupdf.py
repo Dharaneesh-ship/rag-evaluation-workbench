@@ -88,15 +88,16 @@ class PyMuPDFPageRenderer(BasePageRenderer):
                 raise IndexError(
                     f"Page {page_num} out of range for PDF with {n_pages} pages"
                 )
+            import fitz
+
             page = doc[page_num - 1]
             zoom = self._dpi / 72.0  # 72 DPI is PyMuPDF's default
-            mat = page.get_transformation_matrix(zoom, zoom)  # type: ignore[attr-defined]
+            mat = fitz.Matrix(zoom, zoom)
             try:
                 # fitz >= 1.18
                 pix = page.get_pixmap(matrix=mat, colorspace=self._colorspace)  # type: ignore[attr-defined]
             except AttributeError:
                 # fitz < 1.18 fallback
-                import fitz
                 cs = fitz.csRGB if self._colorspace == "RGB" else fitz.csGRAY
                 pix = page.getPixmap(matrix=mat, colorspace=cs)  # type: ignore[attr-defined]
 

@@ -1,9 +1,25 @@
 """PDF header/footer deduplication cleaner — removes repeating page-level blocks."""
 
+import re
 from collections import Counter
 
 from rag.core.contracts.ir_block import IRBlock
 from rag.core.interfaces.cleaner import BaseCleaner
+
+# Digits are masked before repetition matching so footers that embed the
+# page number ("2 of 55 ... | 1/2026") still count as the same text on
+# every page.
+_DIGIT_RE = re.compile(r"\d+")
+
+
+def _normalized_key(text: str) -> str:
+    """Return the repetition-matching key for a block text.
+
+    Masks digit runs and collapses whitespace, so per-page variations
+    (page numbers, dates, document ids) don't defeat the dedupe.
+    """
+    masked = _DIGIT_RE.sub("#", text.strip())
+    return " ".join(masked.split())
 
 # A block is considered a repeating header/footer if it appears on at least
 # this fraction of total pages in the document.
@@ -61,10 +77,10 @@ class PdfHeaderFooterDedupe(BaseCleaner):
         if total_pages < _MIN_PAGES:
             return blocks
 
-        # Count on how many distinct pages each text appears
+        # Count on how many distinct pages each (digit-masked) text appears
         text_to_pages: dict[str, set[int]] = {}
         for block in paged:
-            key = block.text.strip()
+            key = _normalized_key(block.text)
             if key:
                 text_to_pages.setdefault(key, set()).add(block.page)  # type: ignore[arg-type]
 
@@ -80,4 +96,4 @@ class PdfHeaderFooterDedupe(BaseCleaner):
         if not repeating:
             return blocks
 
-        return [b for b in blocks if b.text.strip() not in repeating]
+        return [b for b in blocks if _normalized_key(b.text) not in repeating]

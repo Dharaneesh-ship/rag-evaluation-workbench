@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
+import os
 import tempfile
 from pathlib import Path
 
 import streamlit as st
+from dotenv import load_dotenv
+
+# Load API keys from .env so embedding and the pdf_vision parser tier work
+# regardless of how the studio process was launched.
+load_dotenv(override=False)
 
 st.set_page_config(page_title="Ingest & Inspect · RAG Studio", layout="wide")
 
@@ -32,8 +38,12 @@ for _key, _default in [
 
 with st.sidebar:
     st.header("⚙️ Configuration")
-    db_path = st.text_input("SQLite DB path", value="data/rag.db")
-    index_dir = st.text_input("Index directory", value="data/indexes")
+    db_path = st.text_input(
+        "SQLite DB path", value=os.environ.get("RAG_STUDIO_DB", "data/rag.db")
+    )
+    index_dir = st.text_input(
+        "Index directory", value=os.environ.get("RAG_STUDIO_INDEX_DIR", "data/indexes")
+    )
     collection = st.text_input("Collection name", value="default")
 
     st.divider()
@@ -77,6 +87,24 @@ with st.sidebar:
     token_budget = st.number_input("Chunk token budget", min_value=64, max_value=2048, value=512)
 
     st.divider()
+    st.subheader("Vision (scanned / complex PDFs)")
+    vision_model = st.selectbox(
+        "Vision model",
+        ["gpt-4o-mini", "gpt-4.1-mini", "gpt-4.1-nano"],
+        index=0,
+        help=(
+            "Used for the pdf_vision (full-document) and pdf_hybrid "
+            "(complex-page) parser tiers. Requires OPENAI_API_KEY.\n\n"
+            "**gpt-4o-mini** — current default. $0.15 / $0.60 per 1M "
+            "input/output tokens.\n\n"
+            "**gpt-4.1-mini** — higher quality, higher cost ($0.40 / $1.60).\n\n"
+            "**gpt-4.1-nano** — cheapest ($0.10 / $0.40), but a smaller "
+            "model — may be less accurate transcribing dense tables/charts, "
+            "which is exactly what this tier targets. Test before relying on it."
+        ),
+    )
+
+    st.divider()
     st.subheader("Chunk Browser")
     sort_by = st.selectbox("Sort by", ["Ingestion order", "Token count ↑", "Token count ↓"])
     search_term = st.text_input("Search text", placeholder="keyword in chunk text…")
@@ -91,7 +119,8 @@ with st.sidebar:
 # ---------------------------------------------------------------------------
 
 def _build_pipeline(db_path, index_dir, token_budget, embedding_provider,
-                    embedding_model, vector_dimension, index_type):
+                    embedding_model, vector_dimension, index_type,
+                    vision_model="gpt-4o-mini"):
     """Instantiate stores, indexes, and IngestPipeline. Returns (pipeline, vec_index, kw_index)."""
     from rag.infra.stores.docstore_sqlite import SQLiteDocStore
     from rag.infra.stores.tracestore_sqlite import SQLiteTraceStore
@@ -148,6 +177,7 @@ def _build_pipeline(db_path, index_dir, token_budget, embedding_provider,
         embedding_provider=embed_provider,
         vector_index=vec_index,
         keyword_index=kw_index,
+        vision_model=vision_model,
     )
     return pipeline, vec_index, kw_index
 
@@ -209,11 +239,13 @@ if run_btn and uploaded_files:
         "collection": collection,
         "db_path": db_path,
         "index_dir": index_dir,
+        "vision_model": vision_model,
     }
     try:
         pipeline, vec_index, kw_index = _build_pipeline(
             db_path, index_dir, token_budget, embedding_provider,
             embedding_model, vector_dimension, index_type,
+            vision_model=vision_model,
         )
         results, original_names, doc_ids = [], [], []
         progress = st.progress(0, text="Starting…")
@@ -261,12 +293,14 @@ if run_url_btn and url_input.strip():
         "collection": collection,
         "db_path": db_path,
         "index_dir": index_dir,
+        "vision_model": vision_model,
     }
     try:
         from rag.infra.connectors.web_connector import WebConnector
         pipeline, vec_index, kw_index = _build_pipeline(
             db_path, index_dir, token_budget, embedding_provider,
             embedding_model, vector_dimension, index_type,
+            vision_model=vision_model,
         )
         progress = st.progress(0, text=f"Fetching {len(urls)} URL(s)…")
         artifacts = WebConnector().fetch(urls)
@@ -310,19 +344,30 @@ if results_raw:
         (Path(r.source_path).name, r) for _, r in results_raw
     ]
     results = [r for _, r in named_results]
-    n_ok = sum(1 for r in results if not r.error and not r.skipped)
-    n_skipped = sum(1 for r in results if r.skipped)
-    n_err = sum(1 for r in results if r.error)
+
+    def _status_of(r) -> str:
+        # Older stored results may predate the status field
+        return getattr(r, "status", "failed" if r.error else ("skipped" if r.skipped else "ok"))
+
+    n_ok = sum(1 for r in results if _status_of(r) == "ok")
+    n_skipped = sum(1 for r in results if _status_of(r) == "skipped")
+    n_degraded = sum(
+        1 for r in results if _status_of(r) in ("quality_failed", "empty_content")
+    )
+    n_err = sum(1 for r in results if _status_of(r) in ("failed", "unsupported"))
     total = len(results)
 
-    if n_err == 0:
+    if n_err == 0 and n_degraded == 0:
         st.success(
             f"✅ Ingested **{n_ok}** document(s)"
             + (f", ⏭️ skipped **{n_skipped}** (already up-to-date)" if n_skipped else "")
             + f" — {total} file(s) processed."
         )
     else:
-        st.warning(f"⚠️ {n_ok} succeeded, {n_skipped} skipped, {n_err} failed out of {total}.")
+        st.warning(
+            f"⚠️ {n_ok} succeeded, {n_skipped} skipped, {n_degraded} degraded, "
+            f"{n_err} failed out of {total}."
+        )
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Total blocks", sum(r.block_count for r in results))
@@ -332,10 +377,21 @@ if results_raw:
 
     if total > 1:
         for fname, result in named_results:
-            if result.error:
+            status = _status_of(result)
+            if status in ("failed", "unsupported"):
                 st.error(f"❌ **{fname}** — {result.error}")
-            elif result.skipped:
+            elif status == "skipped":
                 st.warning(f"⏭️ **{fname}** — already up-to-date.")
+            elif status == "empty_content":
+                st.error(
+                    f"🕳️ **{fname}** — parsed but produced 0 chunks; "
+                    "it will be invisible to retrieval."
+                )
+            elif status == "quality_failed":
+                st.warning(
+                    f"⚠️ **{fname}** — ingested, but failed quality gates "
+                    f"({result.chunk_count} chunks, content may be degraded)."
+                )
             else:
                 with st.expander(f"✅ {fname}  ·  {result.chunk_count} chunks  ·  {result.elapsed_ms:.0f} ms"):
                     cc1, cc2, cc3, cc4 = st.columns(4)

@@ -39,20 +39,38 @@ def test_clean_removes_repeating_header(cleaner):
 
 def test_clean_keeps_unique_content(cleaner):
     # Header on all 3 pages (100%) → removed
-    # Unique content on 1/3 pages (33%) → kept (below 50% threshold)
+    # Genuinely unique content on 1/3 pages (33%) → kept (below 50% threshold)
     blocks = [
         _block("Header", page=1),
-        _block("Unique content on page 1.", page=1),
+        _block("Introduction to the topic.", page=1),
         _block("Header", page=2),
-        _block("Unique content on page 2.", page=2),
+        _block("Detailed analysis of results.", page=2),
         _block("Header", page=3),
-        _block("Unique content on page 3.", page=3),
+        _block("Closing remarks and outlook.", page=3),
     ]
     result = cleaner.clean(blocks)
     texts = [b.text for b in result]
-    assert "Unique content on page 1." in texts
-    assert "Unique content on page 2." in texts
-    assert "Unique content on page 3." in texts
+    assert "Introduction to the topic." in texts
+    assert "Detailed analysis of results." in texts
+    assert "Closing remarks and outlook." in texts
+
+
+def test_clean_removes_digit_varying_footer(cleaner):
+    # Footers that embed the page number differ textually on every page but
+    # are the same running element — digit masking must catch them.
+    blocks = [
+        _block("1 of 55   Q4 2025 Chart Book - Powering Up  8674213 | 1/2026", page=1),
+        _block("Real insight about markets.", page=1),
+        _block("2 of 55   Q4 2025 Chart Book - Powering Up  8674213 | 1/2026", page=2),
+        _block("Another real paragraph of analysis.", page=2),
+        _block("3 of 55   Q4 2025 Chart Book - Powering Up  8674213 | 1/2026", page=3),
+        _block("Concluding thoughts on positioning.", page=3),
+    ]
+    result = cleaner.clean(blocks)
+    texts = [b.text for b in result]
+    assert all("Chart Book" not in t for t in texts)
+    assert "Real insight about markets." in texts
+    assert "Another real paragraph of analysis." in texts
 
 
 def test_clean_below_threshold_kept():

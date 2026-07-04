@@ -27,6 +27,7 @@ kept together until actual body text arrives.
 
 import hashlib
 import logging
+import re
 from pathlib import Path
 from typing import Any
 
@@ -75,17 +76,57 @@ def _approx_tokens(text: str) -> int:
     return max(1, len(text) // _CHARS_PER_TOKEN)
 
 
-def _compute_chunk_signature(block_hashes: list[str]) -> str:
+def _compute_chunk_signature(block_hashes: list[str], part: int | None = None) -> str:
     """Compute SHA-256 over the ordered block hashes.
 
     Args:
         block_hashes: Ordered list of block_hash strings.
+        part: Optional part index for chunks produced by splitting a single
+            oversized block — keeps signatures unique when several chunks
+            share the same block hash.
 
     Returns:
         64-character hex digest.
     """
     combined = "|".join(block_hashes)
+    if part is not None:
+        combined += f"#part{part}"
     return hashlib.sha256(combined.encode("utf-8")).hexdigest()
+
+
+# Sentence boundary used when force-splitting a single oversized block.
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?。！？])\s+")
+
+
+def _split_oversized_text(text: str, token_budget: int) -> list[str]:
+    """Split one oversized text into sentence groups within the budget.
+
+    Args:
+        text: Block text whose token count exceeds the budget.
+        token_budget: Maximum tokens per resulting part.
+
+    Returns:
+        List of non-empty text parts, each within the budget where possible
+        (a single sentence longer than the budget stays intact).
+    """
+    sentences = [s for s in _SENTENCE_SPLIT_RE.split(text) if s.strip()]
+    if len(sentences) <= 1:
+        return [text]
+
+    parts: list[str] = []
+    current: list[str] = []
+    current_tokens = 0
+    for sentence in sentences:
+        s_tokens = _approx_tokens(sentence)
+        if current and current_tokens + s_tokens > token_budget:
+            parts.append(" ".join(current))
+            current = []
+            current_tokens = 0
+        current.append(sentence)
+        current_tokens += s_tokens
+    if current:
+        parts.append(" ".join(current))
+    return parts
 
 
 def _build_chunk(doc_id: str, blocks: list[TextBlock], annotations: list[AnchorAnnotation]) -> Chunk:
@@ -212,9 +253,34 @@ class AnchorAwareChunkPacker(BaseChunkPacker):
             """Return True if the buffer contains at least one non-anchor block."""
             return any(a.anchor_type == "none" for a in buffer_anns)
 
+        # Rolling section heading within the current buffer — mirrors the
+        # prefix injection in _build_chunk so budget accounting matches the
+        # tokens actually emitted into stable_text.
+        buffer_heading = ""
+
+        def _effective_tokens(block: TextBlock, is_anchor: bool, heading: str) -> int:
+            """Tokens this block will contribute to stable_text (+1 separator)."""
+            text = block.text.strip()
+            if not is_anchor and heading:
+                text = f"{heading}: {text}"
+            return _approx_tokens(text) + 1
+
         for block, ann in zip(blocks, annotations):
-            block_tokens = _approx_tokens(block.text)
             is_anchor = ann.anchor_type != "none"
+
+            # A single block larger than the whole budget can never fit —
+            # flush the buffer and force-split it by sentences.
+            if _approx_tokens(block.text) > self._token_budget:
+                if buffer_blocks:
+                    chunks.append(_build_chunk(doc_id, buffer_blocks, buffer_anns))
+                    buffer_blocks, buffer_anns = [], []
+                    buffer_tokens, buffer_heading = 0, ""
+                chunks.extend(
+                    self._build_oversized_chunks(doc_id, block, ann)
+                )
+                continue
+
+            block_tokens = _effective_tokens(block, is_anchor, buffer_heading)
 
             # Decide whether to flush the current buffer:
             # - At an anchor boundary (new section heading arrives) AND
@@ -233,13 +299,77 @@ class AnchorAwareChunkPacker(BaseChunkPacker):
                 buffer_blocks = []
                 buffer_anns = []
                 buffer_tokens = 0
+                buffer_heading = ""
+                # Recompute cost against the now-empty buffer (no prefix)
+                block_tokens = _effective_tokens(block, is_anchor, buffer_heading)
 
             buffer_blocks.append(block)
             buffer_anns.append(ann)
             buffer_tokens += block_tokens
+            if is_anchor:
+                buffer_heading = block.text.strip()
 
         # Flush remaining buffer
         if buffer_blocks:
             chunks.append(_build_chunk(doc_id, buffer_blocks, buffer_anns))
 
+        return chunks
+
+    def _build_oversized_chunks(
+        self,
+        doc_id: str,
+        block: TextBlock,
+        ann: AnchorAnnotation,
+    ) -> list[Chunk]:
+        """Split one over-budget block into sentence-group chunks.
+
+        Every resulting chunk references the same source block (same
+        ``block_hash``); a part index is mixed into the chunk signature to
+        keep chunk ids unique.
+
+        Args:
+            doc_id: Parent document ID.
+            block: The oversized TextBlock.
+            ann: Anchor annotation for the block.
+
+        Returns:
+            One Chunk per sentence group.
+        """
+        text = block.text.strip()
+        parts = _split_oversized_text(text, self._token_budget)
+        if len(parts) > 1:
+            logger.info(
+                "Block %s exceeds token budget (%d) — split into %d chunks.",
+                block.block_hash[:12],
+                self._token_budget,
+                len(parts),
+            )
+
+        metadata: dict[str, Any] = {}
+        if block.page is not None:
+            metadata["start_page"] = block.page
+            metadata["end_page"] = block.page
+        if block.section_path:
+            metadata["section_path"] = block.section_path
+        metadata["loc_span"] = [block.sequence, block.sequence]
+
+        chunks: list[Chunk] = []
+        for i, part in enumerate(parts):
+            display = part
+            if i == 0 and ann.anchor_type != "none":
+                display = f"[{ann.anchor_type.upper()}] {part}"
+            chunks.append(
+                Chunk(
+                    doc_id=doc_id,
+                    stable_text=part,
+                    display_text=display,
+                    chunk_signature=_compute_chunk_signature(
+                        [block.block_hash],
+                        part=i if len(parts) > 1 else None,
+                    ),
+                    block_hashes=[block.block_hash],
+                    token_count=_approx_tokens(part),
+                    metadata={**metadata, **({"part": i} if len(parts) > 1 else {})},
+                )
+            )
         return chunks
