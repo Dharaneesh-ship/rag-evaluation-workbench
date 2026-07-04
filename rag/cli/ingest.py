@@ -4,6 +4,13 @@ Usage::
 
     python -m rag.cli.ingest --path document.pdf
     python -m rag.cli.ingest --path document.pdf --collection my_collection
+    python -m rag.cli.ingest --path ./docs                # whole directory
+    python -m rag.cli.ingest --path ./docs --no-recursive
+
+When ``--path`` is a directory, every non-hidden file underneath it is
+ingested and a per-status summary report is printed. The exit code is
+non-zero when any file ends up unretrievable (failed / unsupported /
+empty content), so silent ingest gaps can't slip through scripts or CI.
 """
 
 import argparse
@@ -20,7 +27,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "--path",
         required=True,
         type=Path,
-        help="Path to the file to ingest.",
+        help="Path to the file to ingest, or a directory to batch-ingest.",
+    )
+    parser.add_argument(
+        "--no-recursive",
+        action="store_true",
+        help="When --path is a directory, do not descend into subdirectories.",
     )
     parser.add_argument(
         "--collection",
@@ -54,9 +66,13 @@ def main(argv: list[str] | None = None) -> int:
         Exit code: 0 on success, 1 on failure.
     """
     # Import here to keep startup fast and errors surfaced at call time.
+    from dotenv import load_dotenv
     from rag.infra.stores.docstore_sqlite import SQLiteDocStore
     from rag.infra.stores.tracestore_sqlite import SQLiteTraceStore
     from rag.pipelines.ingest_pipeline import IngestPipeline
+
+    # API keys from .env enable the optional pdf_vision parser tier.
+    load_dotenv(override=False)
 
     args = _build_parser().parse_args(argv)
 
@@ -77,6 +93,20 @@ def main(argv: list[str] | None = None) -> int:
         token_budget=args.token_budget,
     )
 
+    # Directory → batch ingest with a per-status summary report
+    if source_path.is_dir():
+        from rag.pipelines.batch_ingest import BatchIngestRunner
+
+        runner = BatchIngestRunner(pipeline, trace_store)
+        report = runner.run(
+            source_path,
+            recursive=not args.no_recursive,
+            progress=True,
+        )
+        print()
+        print(report.format_summary())
+        return 1 if report.has_problems else 0
+
     result = pipeline.ingest(source_path)
 
     if result.error:
@@ -85,11 +115,12 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     elapsed_s = result.elapsed_ms / 1000
+    status_note = f" [{result.status}]" if result.status != "ok" else ""
     print(
         f"Ingested '{source_path.name}' — "
         f"{result.chunk_count} chunks, "
         f"{result.block_count} blocks, "
-        f"{elapsed_s:.2f}s"
+        f"{elapsed_s:.2f}s{status_note}"
     )
     return 0
 
