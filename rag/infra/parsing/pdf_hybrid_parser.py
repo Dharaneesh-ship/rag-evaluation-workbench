@@ -232,8 +232,6 @@ class PdfHybridParser(BaseParser):
         #      for that page rather than replacing it with the partial vision
         #      output. The text parser often already captures the "missing"
         #      content (PDFs embed accessibility text for charts/dot ratings).
-        vision_blocks: dict[int, list[IRBlock]] = {}
-        truncated_pages: list[int] = []
         for info in complex_pages:
             logger.info(
                 "Vision-escalating page %d of '%s' (%s).",
@@ -241,11 +239,20 @@ class PdfHybridParser(BaseParser):
                 source_path,
                 "; ".join(info.reasons),
             )
-            try:
-                blocks, truncated = self._vision_parser.parse_page_blocks(
-                    source_path, info.page
-                )
-            except Exception as exc:
+
+        # Each page is an independent render+API-call unit, so escalation
+        # runs concurrently — a 55-page deck with 20 complex pages no longer
+        # pays 20 sequential network round-trips.
+        page_results = self._vision_parser.parse_pages_parallel(
+            source_path, [info.page for info in complex_pages]
+        )
+
+        vision_blocks: dict[int, list[IRBlock]] = {}
+        truncated_pages: list[int] = []
+        for info in complex_pages:
+            blocks, truncated, exc = page_results[info.page]
+
+            if exc is not None:
                 logger.warning(
                     "Vision parse failed for page %d of '%s': %s — "
                     "keeping text-parser blocks for this page.",

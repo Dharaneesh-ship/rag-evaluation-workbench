@@ -173,6 +173,80 @@ class TestVisionTruncationWarning:
         assert truncated is False
 
 
+class TestParsePagesParallel:
+    """PdfVisionParser.parse_pages_parallel — the throughput primitive shared
+    by the full-document tier and PdfHybridParser's per-page escalation."""
+
+    def _make_parser(self, page_side_effect, max_workers=8):
+        from rag.infra.parsing.pdf_vision_parser import PdfVisionParser
+
+        parser = PdfVisionParser(
+            renderer=MagicMock(), api_key="test-key", max_workers=max_workers
+        )
+        parser.parse_page_blocks = MagicMock(side_effect=page_side_effect)
+        return parser
+
+    def test_returns_result_per_page_in_success_case(self):
+        def fake(source_path, page_num):
+            return [IRBlock(block_type=BlockType.PARAGRAPH, text=f"page {page_num}", page=page_num)], False
+
+        parser = self._make_parser(fake)
+        results = parser.parse_pages_parallel("doc.pdf", [1, 2, 3])
+
+        assert set(results.keys()) == {1, 2, 3}
+        for page_num in (1, 2, 3):
+            blocks, truncated, exc = results[page_num]
+            assert exc is None
+            assert truncated is False
+            assert blocks[0].text == f"page {page_num}"
+
+    def test_empty_page_list_returns_empty_dict(self):
+        parser = self._make_parser(lambda source_path, page_num: ([], False))
+        assert parser.parse_pages_parallel("doc.pdf", []) == {}
+
+    def test_per_page_exception_isolated_not_raised(self):
+        # A single page's API failure must not prevent other pages from
+        # being processed, and must not raise out of parse_pages_parallel —
+        # callers (hybrid parser) handle per-page fallback themselves.
+        def fake(source_path, page_num):
+            if page_num == 2:
+                raise RuntimeError("API down")
+            return [IRBlock(block_type=BlockType.PARAGRAPH, text="ok", page=page_num)], False
+
+        parser = self._make_parser(fake)
+        results = parser.parse_pages_parallel("doc.pdf", [1, 2, 3])
+
+        assert results[1][2] is None and results[3][2] is None
+        _, _, exc2 = results[2]
+        assert isinstance(exc2, RuntimeError)
+        assert results[2][0] == []  # empty blocks on failure
+
+    def test_concurrency_bounded_by_max_workers(self):
+        # Track the peak number of concurrently-executing calls to prove
+        # pages actually run in parallel (not accidentally serialized) while
+        # respecting the max_workers cap.
+        import threading
+        import time
+
+        lock = threading.Lock()
+        state = {"active": 0, "peak": 0}
+
+        def fake(source_path, page_num):
+            with lock:
+                state["active"] += 1
+                state["peak"] = max(state["peak"], state["active"])
+            time.sleep(0.05)
+            with lock:
+                state["active"] -= 1
+            return [], False
+
+        parser = self._make_parser(fake, max_workers=3)
+        parser.parse_pages_parallel("doc.pdf", list(range(1, 7)))
+
+        assert state["peak"] > 1  # actually ran concurrently
+        assert state["peak"] <= 3  # respected max_workers
+
+
 class TestDrawingAreaTrigger:
     def test_large_filled_chart_escalates_despite_few_paths(self, tmp_path):
         """A bar chart drawn with a handful of big rects must escalate via
@@ -196,10 +270,13 @@ class TestDrawingAreaTrigger:
         doc.close()
 
         vision = MagicMock()
-        vision.parse_page_blocks.return_value = (
-            [IRBlock(block_type=BlockType.IMAGE_CAPTION, text="Figure: bars.", page=1)],
-            False,
-        )
+        vision.parse_pages_parallel.return_value = {
+            1: (
+                [IRBlock(block_type=BlockType.IMAGE_CAPTION, text="Figure: bars.", page=1)],
+                False,
+                None,
+            )
+        }
         hybrid = PdfHybridParser(
             text_parser=PdfPyMuPDFParser(),
             vision_parser=vision,
@@ -207,7 +284,7 @@ class TestDrawingAreaTrigger:
             min_drawing_area_ratio=0.10,
         )
         document = hybrid.parse(str(pdf_path))
-        vision.parse_page_blocks.assert_called_once()
+        vision.parse_pages_parallel.assert_called_once()
         reasons = document.metadata["vision_page_reasons"]["1"]
         assert "drawing_area" in reasons
 
@@ -373,7 +450,7 @@ def chart_image(tmp_path):
 
 
 class TestPdfHybridParser:
-    def _make_hybrid(self, vision_blocks=None, truncated=False, **kwargs):
+    def _make_hybrid(self, vision_blocks=None, truncated=False, exc=None, **kwargs):
         from rag.infra.parsing.pdf_hybrid_parser import PdfHybridParser
 
         vision = MagicMock()
@@ -384,7 +461,11 @@ class TestPdfHybridParser:
                 page=2,
             )
         ]
-        vision.parse_page_blocks.return_value = (blocks, truncated)
+
+        def fake_parse_pages_parallel(source_path, page_nums):
+            return {p: (blocks, truncated, exc) for p in page_nums}
+
+        vision.parse_pages_parallel.side_effect = fake_parse_pages_parallel
         return PdfHybridParser(
             text_parser=PdfPyMuPDFParser(), vision_parser=vision, **kwargs
         ), vision
@@ -394,8 +475,8 @@ class TestPdfHybridParser:
         hybrid, vision = self._make_hybrid()
         document = hybrid.parse(str(pdf_path))
 
-        vision.parse_page_blocks.assert_called_once()
-        assert vision.parse_page_blocks.call_args[0][1] == 2  # page 2 only
+        vision.parse_pages_parallel.assert_called_once()
+        assert vision.parse_pages_parallel.call_args[0][1] == [2]  # page 2 only
         assert document.parse_report.parser_used == "pdf_hybrid"
         assert document.metadata["vision_pages"] == [2]
         # Page 1 text kept, page 2 replaced by vision output
@@ -420,13 +501,12 @@ class TestPdfHybridParser:
 
         hybrid, vision = self._make_hybrid()
         document = hybrid.parse(str(pdf_path))
-        vision.parse_page_blocks.assert_not_called()
+        vision.parse_pages_parallel.assert_not_called()
         assert document.parse_report.parser_used == "pymupdf"
 
     def test_vision_failure_keeps_text_blocks(self, tmp_path, chart_image):
         pdf_path = _make_mixed_pdf(tmp_path, chart_image)
-        hybrid, vision = self._make_hybrid()
-        vision.parse_page_blocks.side_effect = RuntimeError("API down")
+        hybrid, vision = self._make_hybrid(exc=RuntimeError("API down"))
         document = hybrid.parse(str(pdf_path))
 
         page2_text = " ".join(b.text for b in document.blocks if b.page == 2)
@@ -458,7 +538,25 @@ class TestPdfHybridParser:
 
         hybrid, vision = self._make_hybrid(max_vision_pages=2)
         hybrid.parse(str(pdf_path))
-        assert vision.parse_page_blocks.call_count == 2
+        vision.parse_pages_parallel.assert_called_once()
+        assert len(vision.parse_pages_parallel.call_args[0][1]) == 2  # capped
+
+    def test_pages_escalated_concurrently_via_thread_pool(self, tmp_path, chart_image):
+        # Regression guard for the parallelization itself: escalating N
+        # complex pages must issue exactly one parse_pages_parallel() call
+        # carrying all N page numbers, not N sequential calls.
+        pdf_path = tmp_path / "many_charts.pdf"
+        doc = fitz.open()
+        for _ in range(4):
+            page = doc.new_page(width=595, height=842)
+            page.insert_image(fitz.Rect(0, 0, 595, 700), filename=str(chart_image))
+        doc.save(pdf_path)
+        doc.close()
+
+        hybrid, vision = self._make_hybrid(max_vision_pages=4)
+        hybrid.parse(str(pdf_path))
+        vision.parse_pages_parallel.assert_called_once()
+        assert sorted(vision.parse_pages_parallel.call_args[0][1]) == [1, 2, 3, 4]
 
 
 class TestVisionModelSelection:

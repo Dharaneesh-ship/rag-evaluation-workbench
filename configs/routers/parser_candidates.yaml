@@ -17,6 +17,11 @@ vision:
   enabled: true
   # OCR results with mean confidence below this escalate to pdf_vision.
   min_ocr_confidence: 0.6
+  # Max concurrent page-transcription API calls (shared by pdf_vision's
+  # full-document tier and pdf_hybrid's per-page escalation). Vision calls
+  # are network-bound, so this parallelizes well; keep it below your
+  # OpenAI org's per-minute request-rate limit.
+  max_workers: 8
   # Page-level escalation (pdf_hybrid): text-rich PDFs whose charts and
   # multi-column pages would otherwise be mangled or silently dropped.
   page_level:

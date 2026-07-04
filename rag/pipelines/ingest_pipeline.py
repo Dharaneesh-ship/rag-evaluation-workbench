@@ -88,13 +88,49 @@ def _build_ocr_parser():
     )
 
 
-def _build_vision_parser(vision_model: str = "gpt-4o-mini"):
+def _load_router_config(router_config_path: str | Path | None) -> dict:
+    """Load parser_candidates.yaml, auto-detecting the path if not given.
+
+    Args:
+        router_config_path: Explicit path, or None to search parent
+            directories of this file for ``configs/routers/parser_candidates.yaml``.
+
+    Returns:
+        Parsed YAML as a dict, or ``{}`` if PyYAML is unavailable, the file
+        doesn't exist, or it fails to parse.
+    """
+    if _yaml is None:
+        return {}
+
+    config_path = router_config_path
+    if config_path is None:
+        for parent in Path(__file__).resolve().parents:
+            candidate = parent / "configs" / "routers" / "parser_candidates.yaml"
+            if candidate.exists():
+                config_path = candidate
+                break
+    if config_path is None or not Path(config_path).exists():
+        return {}
+
+    try:
+        return _yaml.safe_load(Path(config_path).read_text()) or {}
+    except Exception as exc:  # pragma: no cover
+        logger.warning("Failed to load parser config '%s': %s", config_path, exc)
+        return {}
+
+
+def _build_vision_parser(
+    vision_model: str = "gpt-4o-mini",
+    router_config_path: str | Path | None = None,
+):
     """Build the pdf_vision escalation parser if an OpenAI key is configured.
 
     Args:
         vision_model: OpenAI vision-capable model id used for both the
             full-document (pdf_vision) and per-page (pdf_hybrid) tiers.
             Defaults to ``"gpt-4o-mini"``.
+        router_config_path: Explicit parser_candidates.yaml path, or None
+            for the default project config (used to read ``vision.max_workers``).
 
     Returns:
         A configured ``PdfVisionParser``, or None when the openai package
@@ -112,8 +148,13 @@ def _build_vision_parser(vision_model: str = "gpt-4o-mini"):
         from rag.infra.ocr.renderer_pymupdf import PyMuPDFPageRenderer
         from rag.infra.parsing.pdf_vision_parser import PdfVisionParser
 
+        vision_cfg = _load_router_config(router_config_path).get("vision") or {}
+        max_workers = int(vision_cfg.get("max_workers", 8))
+
         return PdfVisionParser(
-            renderer=PyMuPDFPageRenderer(dpi=150), model=vision_model
+            renderer=PyMuPDFPageRenderer(dpi=150),
+            model=vision_model,
+            max_workers=max_workers,
         )
     except ImportError as exc:
         logger.info(
@@ -138,22 +179,7 @@ def _build_hybrid_parser(text_parser, vision_parser, router_config_path):
     if _yaml is None:
         return None
 
-    config_path = router_config_path
-    if config_path is None:
-        for parent in Path(__file__).resolve().parents:
-            candidate = parent / "configs" / "routers" / "parser_candidates.yaml"
-            if candidate.exists():
-                config_path = candidate
-                break
-    if config_path is None or not Path(config_path).exists():
-        return None
-
-    try:
-        data = _yaml.safe_load(Path(config_path).read_text()) or {}
-    except Exception as exc:  # pragma: no cover
-        logger.warning("Failed to load parser config '%s': %s", config_path, exc)
-        return None
-
+    data = _load_router_config(router_config_path)
     page_cfg = (data.get("vision") or {}).get("page_level") or {}
     if not page_cfg.get("enabled", True):
         logger.info("Page-level vision escalation disabled in config.")
@@ -296,7 +322,9 @@ class IngestPipeline:
         if ocr_parser is not None:
             parser_registry["pdf_ocr"] = ocr_parser
 
-        vision_parser = _build_vision_parser(vision_model=vision_model)
+        vision_parser = _build_vision_parser(
+            vision_model=vision_model, router_config_path=router_config_path
+        )
         if vision_parser is not None:
             parser_registry["pdf_vision"] = vision_parser
 
