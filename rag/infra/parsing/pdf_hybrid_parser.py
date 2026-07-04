@@ -222,9 +222,18 @@ class PdfHybridParser(BaseParser):
             )
             complex_pages = complex_pages[: self._max_vision_pages]
 
-        # Vision-parse the complex pages; fall back to text blocks per page
-        # on any API/render failure so escalation never loses content.
+        # Vision-parse the complex pages. Two ways escalation can fail without
+        # losing content:
+        #   1. API/render exception → keep the text-parser blocks.
+        #   2. Truncated transcript (output cap or content-filter cut) → the
+        #      vision output is partial and may have dropped whole regions
+        #      (e.g. a right-column rating table). A truncated result is
+        #      untrustworthy, so we KEEP the complete text-parser extraction
+        #      for that page rather than replacing it with the partial vision
+        #      output. The text parser often already captures the "missing"
+        #      content (PDFs embed accessibility text for charts/dot ratings).
         vision_blocks: dict[int, list[IRBlock]] = {}
+        truncated_pages: list[int] = []
         for info in complex_pages:
             logger.info(
                 "Vision-escalating page %d of '%s' (%s).",
@@ -233,7 +242,7 @@ class PdfHybridParser(BaseParser):
                 "; ".join(info.reasons),
             )
             try:
-                vision_blocks[info.page] = self._vision_parser.parse_page_blocks(
+                blocks, truncated = self._vision_parser.parse_page_blocks(
                     source_path, info.page
                 )
             except Exception as exc:
@@ -244,6 +253,20 @@ class PdfHybridParser(BaseParser):
                     source_path,
                     exc,
                 )
+                continue
+
+            if truncated:
+                truncated_pages.append(info.page)
+                logger.warning(
+                    "Vision transcript for page %d of '%s' was truncated — "
+                    "keeping the complete text-parser blocks for this page "
+                    "instead of the partial vision output.",
+                    info.page,
+                    source_path,
+                )
+                continue
+
+            vision_blocks[info.page] = blocks
 
         # Splice: replace text blocks of vision-parsed pages, keep the rest.
         text_blocks_by_page: dict[int, list[IRBlock]] = {}
@@ -280,6 +303,9 @@ class PdfHybridParser(BaseParser):
                         for p in complex_pages
                         if p.page in vision_blocks
                     },
+                    # Pages we tried to escalate but whose transcript was cut
+                    # off; text-parser blocks were kept for these.
+                    "vision_truncated_pages": sorted(truncated_pages),
                 },
             }
         )

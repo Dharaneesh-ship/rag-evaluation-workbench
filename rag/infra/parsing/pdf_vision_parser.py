@@ -41,6 +41,13 @@ _DEFAULT_MODEL = "gpt-4o-mini"
 # output tokens; a low cap silently truncates the transcript mid-page.
 _DEFAULT_MAX_TOKENS = 8192
 
+# finish_reasons that mean the transcript is INCOMPLETE — the model stopped
+# before covering the whole page. "length" = output token cap hit;
+# "content_filter" = OpenAI moderation cut the response (fires deterministically
+# on some financial/legal disclaimer content). A truncated transcript is
+# untrustworthy: callers should prefer the complete text-parser extraction.
+_TRUNCATION_REASONS = frozenset({"length", "content_filter"})
+
 _PAGE_PROMPT = (
     "Transcribe this document page to Markdown. Rules:\n"
     "- Preserve headings, paragraphs, and list structure.\n"
@@ -107,7 +114,7 @@ class PdfVisionParser(BaseParser):
         api_key: OpenAI API key. If None, reads ``OPENAI_API_KEY`` env var.
         max_pages: Maximum pages to process (None = all). A hard cap keeps
             a single pathological document from burning the API budget.
-        max_tokens: Completion token cap per page. Defaults to 2048.
+        max_tokens: Completion token cap per page. Defaults to 8192.
 
     Attributes:
         PARSER_ID: Identifier written to ``ParseReport.parser_used``.
@@ -147,14 +154,16 @@ class PdfVisionParser(BaseParser):
         image.save(buffer, format="PNG")
         return base64.b64encode(buffer.getvalue()).decode("ascii")
 
-    def _transcribe_page(self, image: Any) -> str:
+    def _transcribe_page(self, image: Any) -> tuple[str, bool]:
         """Send one page image to the vision model and return its Markdown.
 
         Args:
             image: PIL Image of the rendered page.
 
         Returns:
-            Markdown transcript ("" for blank pages).
+            ``(markdown, truncated)`` where ``truncated`` is True when the
+            model stopped early (output token cap or content-filter cut),
+            meaning the transcript may be missing page content.
         """
         b64 = self._encode_image(image)
         response = self._client.chat.completions.create(
@@ -178,16 +187,20 @@ class PdfVisionParser(BaseParser):
             ],
         )
         choice = response.choices[0]
-        if getattr(choice, "finish_reason", None) == "length":
+        finish_reason = getattr(choice, "finish_reason", None)
+        truncated = finish_reason in _TRUNCATION_REASONS
+        if truncated:
             logger.warning(
-                "Vision transcript hit the %d-token output cap and was "
-                "truncated — content at the bottom of the page is missing. "
-                "Consider raising max_tokens.",
-                self._max_tokens,
+                "Vision transcript was truncated (finish_reason=%s) — part of "
+                "the page is missing. Callers should keep the text-parser "
+                "extraction for this page.",
+                finish_reason,
             )
-        return choice.message.content or ""
+        return choice.message.content or "", truncated
 
-    def parse_page_blocks(self, source_path: str, page_num: int) -> list[IRBlock]:
+    def parse_page_blocks(
+        self, source_path: str, page_num: int
+    ) -> tuple[list[IRBlock], bool]:
         """Transcribe a single page and return its IRBlocks.
 
         Used by the hybrid parser to escalate individual complex pages
@@ -198,11 +211,14 @@ class PdfVisionParser(BaseParser):
             page_num: 1-based page number.
 
         Returns:
-            IRBlocks for the page (empty for blank pages).
+            ``(blocks, truncated)`` — IRBlocks for the page (empty for blank
+            pages), and whether the transcript was cut off early. On a
+            truncated transcript the blocks are partial and the caller should
+            prefer the text-parser extraction for this page.
         """
         image = self._renderer.render(source_path, page_num)
-        markdown = self._transcribe_page(image)
-        return _markdown_to_blocks(markdown, page_num)
+        markdown, truncated = self._transcribe_page(image)
+        return _markdown_to_blocks(markdown, page_num), truncated
 
     def parse(self, source_path: str) -> Document:
         """Parse a PDF by transcribing each rendered page with the LLM.
@@ -232,7 +248,7 @@ class PdfVisionParser(BaseParser):
 
         for page_num in range(1, end_page + 1):
             image = self._renderer.render(source_path, page_num)
-            markdown = self._transcribe_page(image)
+            markdown, _truncated = self._transcribe_page(image)
             page_blocks = _markdown_to_blocks(markdown, page_num)
             all_blocks.extend(page_blocks)
             page_chars = sum(len(b.text) for b in page_blocks)

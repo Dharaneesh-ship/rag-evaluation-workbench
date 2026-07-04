@@ -133,22 +133,44 @@ class TestInvisibleCharsAndLowercase:
 
 
 class TestVisionTruncationWarning:
-    def test_truncated_transcript_logs_warning(self, caplog):
-        import logging
+    def _make_parser(self, finish_reason: str, content: str = "partial transcript"):
         from rag.infra.parsing.pdf_vision_parser import PdfVisionParser
 
         parser = PdfVisionParser(renderer=MagicMock(), api_key="test-key")
         resp = MagicMock()
-        resp.choices[0].message.content = "partial transcript"
-        resp.choices[0].finish_reason = "length"
+        resp.choices[0].message.content = content
+        resp.choices[0].finish_reason = finish_reason
         client = MagicMock()
         client.chat.completions.create.return_value = resp
         parser._client = client
+        return parser
 
+    def test_length_truncation_flagged_and_warned(self, caplog):
+        import logging
+
+        parser = self._make_parser("length")
         with caplog.at_level(logging.WARNING):
-            text = parser._transcribe_page(MagicMock())
+            text, truncated = parser._transcribe_page(MagicMock())
         assert text == "partial transcript"
+        assert truncated is True
         assert any("truncated" in r.message for r in caplog.records)
+
+    def test_content_filter_truncation_flagged(self, caplog):
+        # Real-world case: OpenAI moderation deterministically cuts the
+        # transcript on some financial disclaimer content.
+        import logging
+
+        parser = self._make_parser("content_filter")
+        with caplog.at_level(logging.WARNING):
+            text, truncated = parser._transcribe_page(MagicMock())
+        assert truncated is True
+        assert any("truncated" in r.message for r in caplog.records)
+
+    def test_complete_transcript_not_flagged(self):
+        parser = self._make_parser("stop", content="full page")
+        text, truncated = parser._transcribe_page(MagicMock())
+        assert text == "full page"
+        assert truncated is False
 
 
 class TestDrawingAreaTrigger:
@@ -174,9 +196,10 @@ class TestDrawingAreaTrigger:
         doc.close()
 
         vision = MagicMock()
-        vision.parse_page_blocks.return_value = [
-            IRBlock(block_type=BlockType.IMAGE_CAPTION, text="Figure: bars.", page=1)
-        ]
+        vision.parse_page_blocks.return_value = (
+            [IRBlock(block_type=BlockType.IMAGE_CAPTION, text="Figure: bars.", page=1)],
+            False,
+        )
         hybrid = PdfHybridParser(
             text_parser=PdfPyMuPDFParser(),
             vision_parser=vision,
@@ -350,17 +373,18 @@ def chart_image(tmp_path):
 
 
 class TestPdfHybridParser:
-    def _make_hybrid(self, vision_blocks=None, **kwargs):
+    def _make_hybrid(self, vision_blocks=None, truncated=False, **kwargs):
         from rag.infra.parsing.pdf_hybrid_parser import PdfHybridParser
 
         vision = MagicMock()
-        vision.parse_page_blocks.return_value = vision_blocks or [
+        blocks = vision_blocks or [
             IRBlock(
                 block_type=BlockType.IMAGE_CAPTION,
                 text="Figure: a line chart showing scenario outcomes.",
                 page=2,
             )
         ]
+        vision.parse_page_blocks.return_value = (blocks, truncated)
         return PdfHybridParser(
             text_parser=PdfPyMuPDFParser(), vision_parser=vision, **kwargs
         ), vision
@@ -408,6 +432,20 @@ class TestPdfHybridParser:
         page2_text = " ".join(b.text for b in document.blocks if b.page == 2)
         assert "tiny caption" in page2_text  # text-parser blocks preserved
         assert document.metadata["vision_pages"] == []
+
+    def test_truncated_vision_keeps_text_blocks(self, tmp_path, chart_image):
+        # A truncated transcript (content_filter / length) may have dropped a
+        # whole region. The complete text-parser blocks for that page must be
+        # kept rather than replaced by the partial vision output.
+        pdf_path = _make_mixed_pdf(tmp_path, chart_image)
+        hybrid, vision = self._make_hybrid(truncated=True)
+        document = hybrid.parse(str(pdf_path))
+
+        page2_text = " ".join(b.text for b in document.blocks if b.page == 2)
+        assert "tiny caption" in page2_text          # text-parser kept
+        assert "line chart" not in page2_text        # partial vision discarded
+        assert document.metadata["vision_pages"] == []
+        assert document.metadata["vision_truncated_pages"] == [2]
 
     def test_max_vision_pages_caps_api_calls(self, tmp_path, chart_image):
         pdf_path = tmp_path / "many_charts.pdf"
