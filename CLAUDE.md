@@ -4,11 +4,16 @@ This project uses a DEV_SPEC-driven development workflow. All implementation wor
 
 ## Skills
 
-This project has 3 skills in `.claude/skills/`:
+This project has 3 workflow skills in `.claude/skills/` (flat `.md` files, triggered by the keywords in Quick Commands below):
 
 - **dev-workflow** — Main orchestrator. Finds the next task, coordinates implementation and checkpoint.
 - **implement** — Reads task spec, writes code, runs tests, iterates on failures.
 - **checkpoint** — Summarizes completed work, updates progress in DEV_SPEC, prepares git commit.
+
+It also has 2 standard Claude Code skills (auto-discovered):
+
+- **resume-writer** (`.claude/skills/resume-writer/SKILL.md`) — Generates tailored resume project-experience bullets from this project's real technical highlights.
+- **interview-prep** (`.claude/skills/interview-prep/SKILL.md`) — Mock technical interviewer that grills a resume against this project's real implementation (RRF/FAISS/BM25 internals, chunk_id hashing, MCP transport, etc.) to catch exaggeration; generates a scored report.
 
 ## Quick Commands
 

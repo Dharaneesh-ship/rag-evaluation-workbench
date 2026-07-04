@@ -1,0 +1,20 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "studio",
+      "runtimeExecutable": "env",
+      "runtimeArgs": [
+        "KMP_DUPLICATE_LIB_OK=TRUE",
+        "streamlit",
+        "run",
+        "rag/app/studio/studio.py",
+        "--server.headless",
+        "true",
+        "--server.port",
+        "8501"
+      ],
+      "port": 8501
+    }
+  ]
+}
