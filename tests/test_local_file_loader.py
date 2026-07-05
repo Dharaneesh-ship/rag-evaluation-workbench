@@ -2,7 +2,11 @@
 
 import pytest
 
-from rag.infra.loading.local_file_loader import LocalFileLoader, RawArtifact
+from rag.infra.loading.local_file_loader import (
+    FileTooLargeError,
+    LocalFileLoader,
+    RawArtifact,
+)
 
 
 @pytest.fixture
@@ -68,3 +72,50 @@ class TestLocalFileLoader:
         artifact = loader.load(binary_file)
         assert artifact.raw_bytes == b"\x00\x01\x02\x03"
         assert artifact.metadata["extension"] == ".bin"
+
+
+@pytest.mark.unit
+class TestLocalFileLoaderSizeGuard:
+    def test_oversized_file_raises_before_reading(self, tmp_path):
+        big_file = tmp_path / "big.bin"
+        big_file.write_bytes(b"x" * 1000)
+        loader = LocalFileLoader(max_file_size_bytes=500)
+
+        with pytest.raises(FileTooLargeError, match="500"):
+            loader.load(big_file)
+
+    def test_file_too_large_error_is_an_os_error(self, tmp_path):
+        # Callers already catching OSError from load() (FileNotFoundError,
+        # PermissionError) must catch this too without code changes.
+        big_file = tmp_path / "big.bin"
+        big_file.write_bytes(b"x" * 1000)
+        loader = LocalFileLoader(max_file_size_bytes=500)
+
+        with pytest.raises(OSError):
+            loader.load(big_file)
+
+    def test_file_at_exactly_the_limit_is_allowed(self, tmp_path):
+        f = tmp_path / "exact.bin"
+        f.write_bytes(b"x" * 500)
+        loader = LocalFileLoader(max_file_size_bytes=500)
+
+        artifact = loader.load(f)  # must not raise
+        assert artifact.size_bytes == 500
+
+    def test_file_under_the_limit_is_allowed(self, sample_txt):
+        loader = LocalFileLoader(max_file_size_bytes=10_000)
+        loader.load(sample_txt)  # must not raise
+
+    def test_none_disables_the_check(self, tmp_path):
+        big_file = tmp_path / "big.bin"
+        big_file.write_bytes(b"x" * 10_000)
+        loader = LocalFileLoader(max_file_size_bytes=None)
+
+        artifact = loader.load(big_file)  # must not raise
+        assert artifact.size_bytes == 10_000
+
+    def test_default_loader_uses_500mb_limit(self):
+        from rag.infra.loading.local_file_loader import DEFAULT_MAX_FILE_SIZE_BYTES
+
+        assert DEFAULT_MAX_FILE_SIZE_BYTES == 500 * 1024 * 1024
+        assert LocalFileLoader()._max_file_size_bytes == DEFAULT_MAX_FILE_SIZE_BYTES

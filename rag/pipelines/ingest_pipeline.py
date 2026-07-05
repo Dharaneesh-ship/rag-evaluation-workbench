@@ -2,7 +2,7 @@
 
 import logging
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -22,7 +22,10 @@ from rag.core.utils.hashing import BlockDiffResult, diff_blocks, fingerprint_byt
 from rag.infra.cleaning.cleaner_pipeline import CleanerPipeline
 from rag.infra.chunking.block_splitter_paragraph import ParagraphBlockSplitter
 from rag.infra.chunking.chunk_packer_anchor_aware import AnchorAwareChunkPacker
-from rag.infra.loading.local_file_loader import LocalFileLoader
+from rag.infra.loading.local_file_loader import (
+    DEFAULT_MAX_FILE_SIZE_BYTES,
+    LocalFileLoader,
+)
 from rag.infra.parsing.docx_parser import DocxParser
 from rag.infra.parsing.html_trafilatura import HtmlTrafilaturaParser
 from rag.infra.parsing.md_parser import MdParser
@@ -299,6 +302,9 @@ class IngestPipeline:
         anchor_config_path: Path to anchors.yaml. None = auto-detect.
         vision_model: OpenAI vision-capable model id for the pdf_vision and
             pdf_hybrid parser tiers. Defaults to ``"gpt-4o-mini"``.
+        max_file_size_bytes: Files larger than this are rejected before being
+            read into memory (see ``LocalFileLoader``). Defaults to 500 MB;
+            pass ``None`` to disable the check.
     """
 
     # Default guardrail thresholds (used when no config file is found)
@@ -320,6 +326,7 @@ class IngestPipeline:
         resync_config_path: str | Path | None = None,
         index_dir: str | Path | None = None,
         vision_model: str = "gpt-4o-mini",
+        max_file_size_bytes: int | None = DEFAULT_MAX_FILE_SIZE_BYTES,
     ) -> None:
         self._doc_store = doc_store
         self._trace_store = trace_store
@@ -328,7 +335,7 @@ class IngestPipeline:
         self._keyword_index = keyword_index
         self._index_dir = Path(index_dir) if index_dir else None
 
-        self._loader = LocalFileLoader()
+        self._loader = LocalFileLoader(max_file_size_bytes=max_file_size_bytes)
         self._sniffer = CompositeSniffer()
 
         parser_registry = {
@@ -637,22 +644,7 @@ class IngestPipeline:
                 )
             return prepared, start
 
-        if max_workers <= 1:
-            prepared_results = [_prepare_job(*job[:2], job[2]) for job in jobs]
-        else:
-            prepared_results = [None] * len(jobs)
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                future_to_index = {
-                    executor.submit(_prepare_job, resolved, canonical, run_id): i
-                    for i, (resolved, canonical, run_id) in enumerate(jobs)
-                }
-                for future in as_completed(future_to_index):
-                    prepared_results[future_to_index[future]] = future.result()
-
-        # Commit sequentially, in original file order, on this thread —
-        # this is the single-writer section (DocStore + shared indexes).
-        results: list[IngestResult] = []
-        for (resolved, canonical, run_id), (prepared, start) in zip(jobs, prepared_results):
+        def _commit_job(canonical: str, run_id: str, prepared, start: float) -> IngestResult:
             if isinstance(prepared, IngestResult):
                 result = prepared
             else:
@@ -683,7 +675,51 @@ class IngestPipeline:
                     "status": result.status,
                 },
             )
-            results.append(result)
+            return result
+
+        # Commit each document as soon as its prepare finishes, interleaved
+        # with the concurrent prepare pool, rather than collecting every
+        # prepared result before committing any of them. The latter would
+        # hold N documents' full parsed/chunked/embedded state in memory at
+        # once for a batch of N files — peak memory would scale with batch
+        # size instead of max_workers. Commit itself still runs one document
+        # at a time on this thread (single-writer: DocStore + shared indexes).
+        results: list[Optional[IngestResult]] = [None] * len(jobs)
+        if max_workers <= 1:
+            for i, (resolved, canonical, run_id) in enumerate(jobs):
+                prepared, start = _prepare_job(resolved, canonical, run_id)
+                results[i] = _commit_job(canonical, run_id, prepared, start)
+        else:
+            # Bounded sliding window: at most max_workers _prepare() calls are
+            # ever submitted-but-uncommitted at once. Submitting all N jobs
+            # upfront (via executor.map/as_completed on a full submit-all
+            # dict) does NOT bound memory to max_workers — worker threads
+            # race ahead of a slow consumer and finish (holding full parsed/
+            # chunked results in their Future) far faster than the main
+            # thread can commit them, so completed-but-uncommitted results
+            # can still pile up to the full batch size. Only submitting the
+            # next job after a slot is freed by a commit provides real
+            # backpressure.
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                pending = list(enumerate(jobs))
+                in_flight: dict = {}
+
+                def _submit_next() -> None:
+                    if pending:
+                        i, (resolved, canonical, run_id) = pending.pop(0)
+                        future = executor.submit(_prepare_job, resolved, canonical, run_id)
+                        in_flight[future] = (i, canonical, run_id)
+
+                for _ in range(min(max_workers, len(pending))):
+                    _submit_next()
+
+                while in_flight:
+                    done, _ = wait(in_flight.keys(), return_when=FIRST_COMPLETED)
+                    for future in done:
+                        i, canonical, run_id = in_flight.pop(future)
+                        prepared, start = future.result()
+                        results[i] = _commit_job(canonical, run_id, prepared, start)
+                        _submit_next()
 
         return results
 

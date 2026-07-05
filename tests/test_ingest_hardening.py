@@ -649,6 +649,59 @@ class TestIngestMany:
         with pytest.raises(ValueError):
             pipeline.ingest_many(paths, canonical_names=["only-one"])
 
+    def test_commits_interleaved_not_batched_after_all_prepares(self, tmp_path, monkeypatch):
+        # Regression guard: ingest_many must commit each document as its
+        # prepare finishes, not collect every prepared result before
+        # committing any of them. The latter holds N documents' full
+        # parsed/chunked state in memory at once for a batch of N — peak
+        # memory would scale with batch size instead of max_workers.
+        #
+        # Proof: track how many _prepare() calls are "in flight" (started,
+        # not yet committed) at the moment each _commit() runs. Under
+        # streaming commits this must stay <= max_workers; under the old
+        # "drain all futures, then commit all" behavior it would climb to
+        # the full batch size (12) before any commit happens.
+        pipeline, _ = self._make_pipeline(tmp_path)
+        paths = self._write_docs(tmp_path, 12)
+        max_workers = 3
+
+        in_flight = 0
+        peak_in_flight = 0
+        lock = __import__("threading").Lock()
+
+        original_prepare = pipeline._prepare
+        original_commit = pipeline._commit
+
+        def tracked_prepare(*args, **kwargs):
+            nonlocal in_flight, peak_in_flight
+            with lock:
+                in_flight += 1
+                peak_in_flight = max(peak_in_flight, in_flight)
+            try:
+                return original_prepare(*args, **kwargs)
+            finally:
+                pass  # decremented in tracked_commit, once actually committed
+
+        def tracked_commit(*args, **kwargs):
+            nonlocal in_flight
+            try:
+                return original_commit(*args, **kwargs)
+            finally:
+                with lock:
+                    in_flight -= 1
+
+        monkeypatch.setattr(pipeline, "_prepare", tracked_prepare)
+        monkeypatch.setattr(pipeline, "_commit", tracked_commit)
+
+        results = pipeline.ingest_many(paths, max_workers=max_workers)
+
+        assert [r.status for r in results] == ["ok"] * 12
+        assert peak_in_flight <= max_workers, (
+            f"peak in-flight prepared-but-uncommitted documents was "
+            f"{peak_in_flight}, expected <= max_workers ({max_workers}) — "
+            f"commits are not being interleaved with prepares"
+        )
+
     def test_combined_with_batch_mode_defers_rebuild(self, tmp_path):
         pipeline, keyword_index = self._make_pipeline(tmp_path)
         paths = self._write_docs(tmp_path, 8)
@@ -666,6 +719,42 @@ class TestIngestMany:
 # ---------------------------------------------------------------------------
 # Batch ingest report
 # ---------------------------------------------------------------------------
+
+
+class TestFileSizeGuard:
+    def test_oversized_file_fails_cleanly_not_oom_risk(self, tmp_path):
+        # LocalFileLoader.read_bytes() has no streaming fallback — without a
+        # size guard, an oversized file would be read entirely into memory
+        # before any check runs. IngestPipeline must reject it up front and
+        # report a clean "failed" status, not propagate an unhandled error.
+        from rag.infra.stores.docstore_sqlite import SQLiteDocStore
+        from rag.infra.stores.tracestore_sqlite import SQLiteTraceStore
+        from rag.pipelines.ingest_pipeline import IngestPipeline
+
+        db = tmp_path / "test.db"
+        pipeline = IngestPipeline(
+            SQLiteDocStore(db), SQLiteTraceStore(db), max_file_size_bytes=500
+        )
+        f = tmp_path / "big.md"
+        f.write_text("x" * 1000)
+
+        result = pipeline.ingest(f)
+
+        assert result.status == "failed"
+        assert "500" in result.error or "MB" in result.error
+
+    def test_default_pipeline_allows_normal_sized_files(self, tmp_path):
+        from rag.infra.stores.docstore_sqlite import SQLiteDocStore
+        from rag.infra.stores.tracestore_sqlite import SQLiteTraceStore
+        from rag.pipelines.ingest_pipeline import IngestPipeline
+
+        db = tmp_path / "test.db"
+        pipeline = IngestPipeline(SQLiteDocStore(db), SQLiteTraceStore(db))
+        f = tmp_path / "normal.md"
+        f.write_text("# Title\n\nContent about cats and dogs with enough words.")
+
+        result = pipeline.ingest(f)
+        assert result.status == "ok"
 
 
 class TestBatchIngest:
