@@ -1,8 +1,16 @@
-"""MCP server — exposes rag.ingest, rag.query, rag.eval.run, and rag.sync_source tools."""
+"""MCP server — exposes rag.ingest, rag.query, rag.eval.run, and rag.sync_source tools.
+
+stdout is reserved exclusively for the MCP JSON-RPC protocol stream — any
+stray text written to it (a debug ``print()``, a verbose third-party
+library) corrupts the protocol from the client's perspective. See
+``_harden_stdio()`` below.
+"""
 
 from __future__ import annotations
 
+import builtins
 import logging
+import sys
 
 from mcp.server.fastmcp import FastMCP
 
@@ -549,8 +557,52 @@ def list_collections(db_path: str = "data/rag.db") -> ListCollectionsOutput:
 
 
 # ---------------------------------------------------------------------------
+# stdio hardening
+# ---------------------------------------------------------------------------
+
+
+def _harden_stdio() -> None:
+    """Make stdout-safety an explicit, structural guarantee, not an accident.
+
+    Without this, stdout only stays clean for the JSON-RPC protocol because
+    nothing in this codebase happens to call ``logging.basicConfig()`` with
+    a stdout stream, and Python's logging "handler of last resort" defaults
+    to stderr. That's correct today but not *guaranteed* — a future
+    contributor's debug ``print()``, or a new dependency that logs to
+    stdout by default, would silently corrupt the protocol stream with no
+    clear signal pointing at the cause. This makes the invariant explicit:
+
+    1. Root logger gets an explicit ``StreamHandler(sys.stderr)`` — turns
+       "nobody configured stdout" into "stderr is configured on purpose."
+    2. ``print()`` is rebound to always write to stderr, so any print
+       anywhere in the imported ``rag`` package (or a dependency) physically
+       cannot reach the real stdout for the remainder of the process.
+
+    Call once, before ``mcp.run()`` — not at import time, so importing this
+    module for testing (which relies on capturing stdout/stderr normally)
+    is unaffected.
+    """
+    root = logging.getLogger()
+    root.handlers = [logging.StreamHandler(sys.stderr)]
+    root.setLevel(logging.INFO)
+
+    original_print = builtins.print
+
+    def _stderr_print(*args, **kwargs):
+        # Force stderr regardless of any explicit file= the caller passed —
+        # overriding rather than pre-binding avoids a "multiple values for
+        # file" TypeError if some code does print(..., file=sys.stdout).
+        kwargs["file"] = sys.stderr
+        return original_print(*args, **kwargs)
+
+    builtins.print = _stderr_print
+    logger.info("stdio hardened: logging and print() routed to stderr.")
+
+
+# ---------------------------------------------------------------------------
 # Entry point for running as a standalone MCP server
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    _harden_stdio()
     mcp.run()

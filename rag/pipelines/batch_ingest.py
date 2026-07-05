@@ -18,7 +18,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from rag.core.interfaces.trace_store import BaseTraceStore
 from rag.pipelines.ingest_pipeline import IngestPipeline, IngestResult
@@ -172,7 +172,7 @@ class BatchIngestRunner:
         self,
         root: str | Path,
         recursive: bool = True,
-        progress: bool = False,
+        on_progress: Optional[Callable[[str], None]] = None,
         workers: int = 1,
     ) -> BatchIngestReport:
         """Ingest all files under ``root`` and return the aggregated report.
@@ -180,7 +180,14 @@ class BatchIngestRunner:
         Args:
             root: Directory containing the files to ingest.
             recursive: Descend into subdirectories. Defaults to True.
-            progress: Print one line per file while running.
+            on_progress: Optional callback invoked with one line of progress
+                text per event. This is pipeline/library code that may be
+                imported by non-CLI callers (the MCP server, Studio) — it
+                must never print to stdout directly, since that would
+                corrupt the MCP JSON-RPC protocol stream if this ever runs
+                in that process. Callers that want CLI-style stdout output
+                pass e.g. ``on_progress=lambda line: print(line, flush=True)``
+                themselves, keeping the actual print() call in CLI-only code.
             workers: Concurrent prepare-phase threads (parse/clean/chunk/
                 embed). ``1`` ingests sequentially. DocStore writes and
                 index updates always run one file at a time regardless of
@@ -193,8 +200,8 @@ class BatchIngestRunner:
         files = discover_files(root, recursive=recursive)
         report = BatchIngestReport(root=str(root))
 
-        if progress:
-            print(f"Ingesting {len(files)} file(s) (workers={workers})...", flush=True)
+        if on_progress is not None:
+            on_progress(f"Ingesting {len(files)} file(s) (workers={workers})...")
 
         # Batch mode defers index rebuild/disk-save from "every document" to
         # "once at the end" — see IngestPipeline.begin_batch() docstring for
@@ -205,9 +212,9 @@ class BatchIngestRunner:
         finally:
             self._pipeline.end_batch()
 
-        if progress:
+        if on_progress is not None:
             for i, (path, result) in enumerate(zip(files, report.results), start=1):
-                print(f"[{i}/{len(files)}] {path.name}: {result.status}", flush=True)
+                on_progress(f"[{i}/{len(files)}] {path.name}: {result.status}")
 
         if self._trace_store is not None:
             self._trace_store.save_run(

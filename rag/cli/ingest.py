@@ -110,7 +110,7 @@ def main(argv: list[str] | None = None) -> int:
         report = runner.run(
             source_path,
             recursive=not args.no_recursive,
-            progress=True,
+            on_progress=lambda line: print(line, flush=True),
             workers=args.workers,
         )
         print()
