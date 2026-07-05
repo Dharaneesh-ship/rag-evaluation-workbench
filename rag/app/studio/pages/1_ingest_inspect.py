@@ -105,6 +105,32 @@ with st.sidebar:
     )
 
     st.divider()
+    st.subheader("Metadata Enrichment")
+    enrich_metadata = st.checkbox(
+        "Generate title/summary/tags per chunk (LLM)",
+        value=False,
+        help=(
+            "Off by default — real, metered API cost per document on top of "
+            "parsing/embedding (gpt-4o-mini, batched, ~$0.001-0.002/doc). "
+            "Falls back to a rules-based enricher automatically if the LLM "
+            "call fails. Shown per-chunk in the browser below."
+        ),
+    )
+    enrich_fold = st.checkbox(
+        "Also fold title into retrievable text",
+        value=False,
+        disabled=not enrich_metadata,
+        help=(
+            "When on, each chunk's generated title is prefixed onto its "
+            "BM25/embedding-indexed text — not just the chunk-browser "
+            "display — so enrichment can actually move retrieval results, "
+            "not only make citations look nicer. A deliberate choice since "
+            "it changes retrieval behavior; see scripts/asqa_eval.py "
+            "--enrich/--enrich-fold for a measured before/after comparison."
+        ),
+    )
+
+    st.divider()
     st.subheader("Chunk Browser")
     sort_by = st.selectbox("Sort by", ["Ingestion order", "Token count ↑", "Token count ↓"])
     search_term = st.text_input("Search text", placeholder="keyword in chunk text…")
@@ -120,7 +146,8 @@ with st.sidebar:
 
 def _build_pipeline(db_path, index_dir, token_budget, embedding_provider,
                     embedding_model, vector_dimension, index_type,
-                    index_mgr, vision_model="gpt-4o-mini"):
+                    index_mgr, vision_model="gpt-4o-mini",
+                    enrich_metadata=False, enrich_fold=False):
     """Instantiate stores and IngestPipeline against a caller-provided IndexManager.
 
     Args:
@@ -181,6 +208,8 @@ def _build_pipeline(db_path, index_dir, token_budget, embedding_provider,
         vector_index=vec_index,
         keyword_index=kw_index,
         vision_model=vision_model,
+        enrich_metadata=enrich_metadata,
+        enrich_fold_into_stable_text=enrich_fold,
     )
     return pipeline, vec_index, kw_index
 
@@ -258,6 +287,7 @@ if run_btn and uploaded_files:
                 db_path, index_dir, token_budget, embedding_provider,
                 embedding_model, vector_dimension, index_type,
                 index_mgr=index_mgr, vision_model=vision_model,
+                enrich_metadata=enrich_metadata, enrich_fold=enrich_fold,
             )
             results, original_names, doc_ids = [], [], []
             progress = st.progress(0, text="Starting…")
@@ -313,6 +343,7 @@ if run_url_btn and url_input.strip():
                 db_path, index_dir, token_budget, embedding_provider,
                 embedding_model, vector_dimension, index_type,
                 index_mgr=index_mgr, vision_model=vision_model,
+                enrich_metadata=enrich_metadata, enrich_fold=enrich_fold,
             )
             progress = st.progress(0, text=f"Fetching {len(urls)} URL(s)…")
             artifacts = WebConnector().fetch(urls)
@@ -518,7 +549,9 @@ with inspect_tab_chunks:
                     ).name or chunk.doc_id[:12]
                     t = chunk.token_count
                     badge = f"🟢 {t} tok" if t <= 256 else (f"🟡 {t} tok" if t <= 450 else f"🔴 {t} tok")
-                    label = f"**#{i}** · `{(chunk.chunk_id or '')[:12]}…` · 📄 {doc_name} · {badge}"
+                    enrich_title = (chunk.metadata or {}).get("title")
+                    title_part = f" · 🏷️ {enrich_title}" if enrich_title else ""
+                    label = f"**#{i}** · `{(chunk.chunk_id or '')[:12]}…` · 📄 {doc_name} · {badge}{title_part}"
                     with st.expander(label, expanded=False):
                         col_meta, col_text = st.columns([1, 2])
                         with col_meta:
@@ -531,6 +564,19 @@ with inspect_tab_chunks:
                                 pages = chunk.metadata.get("start_page") or chunk.metadata.get("page")
                                 if pages:
                                     st.markdown(f"**Page:** `{pages}`")
+                                # LLM metadata enrichment (title/summary/tags),
+                                # if IngestPipeline(enrich_metadata=True) was
+                                # used — surfaced as readable fields rather
+                                # than only the raw JSON dump below.
+                                if enrich_title:
+                                    st.markdown(f"**Title:** {enrich_title}")
+                                if chunk.metadata.get("summary"):
+                                    st.markdown(f"**Summary:** {chunk.metadata['summary']}")
+                                if chunk.metadata.get("tags"):
+                                    tag_badges = " ".join(
+                                        f"`{t}`" for t in chunk.metadata["tags"]
+                                    )
+                                    st.markdown(f"**Tags:** {tag_badges}")
                                 st.json(chunk.metadata, expanded=False)
                         with col_text:
                             st.markdown("**Chunk text:**")

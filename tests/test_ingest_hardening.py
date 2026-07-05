@@ -863,6 +863,134 @@ class TestStageTimingsAndCost:
 
 
 # ---------------------------------------------------------------------------
+# LLM metadata enrichment wiring
+# ---------------------------------------------------------------------------
+
+
+class TestMetadataEnrichmentWiring:
+    def _make_pipeline_with_mock_enricher(self, tmp_path, fold=False, tokens=(50, 10)):
+        # enrich_metadata=False avoids constructing a real OpenAILLMClient
+        # (would need OPENAI_API_KEY); the mock enricher is attached
+        # directly afterward to exercise _prepare()'s real wiring logic.
+        from rag.infra.stores.docstore_sqlite import SQLiteDocStore
+        from rag.infra.stores.tracestore_sqlite import SQLiteTraceStore
+        from rag.infra.chunking.metadata_enricher_llm_batch import LLMEnrichmentSummary
+        from rag.pipelines.ingest_pipeline import IngestPipeline
+
+        db = tmp_path / "test.db"
+        pipeline = IngestPipeline(
+            SQLiteDocStore(db),
+            SQLiteTraceStore(db),
+            enrich_metadata=False,
+            enrich_fold_into_stable_text=fold,
+        )
+
+        mock_enricher = MagicMock()
+
+        def fake_enrich(chunks):
+            for c in chunks:
+                c.metadata["title"] = "Mock Title"
+                c.metadata["summary"] = "Mock summary."
+                c.metadata["tags"] = ["mock", "tag"]
+            return LLMEnrichmentSummary(
+                results=[], prompt_tokens=tokens[0], completion_tokens=tokens[1]
+            )
+
+        mock_enricher.enrich_chunks.side_effect = fake_enrich
+        pipeline._metadata_enricher = mock_enricher
+        pipeline._enrich_model = "gpt-4o-mini"
+        return pipeline
+
+    def _write_doc(self, tmp_path):
+        f = tmp_path / "doc.md"
+        f.write_text("# Title\n\nContent about cats and dogs with enough words.")
+        return f
+
+    def test_disabled_by_default_no_enrichment_applied(self, tmp_path):
+        from rag.infra.stores.docstore_sqlite import SQLiteDocStore
+        from rag.infra.stores.tracestore_sqlite import SQLiteTraceStore
+        from rag.pipelines.ingest_pipeline import IngestPipeline
+
+        db = tmp_path / "test.db"
+        pipeline = IngestPipeline(SQLiteDocStore(db), SQLiteTraceStore(db))
+        assert pipeline._metadata_enricher is None
+
+        result = pipeline.ingest(self._write_doc(tmp_path))
+        assert result.status == "ok"
+        assert "enrich" not in result.stage_timings_ms
+        assert result.cost_usd == 0.0
+
+    def test_enabled_populates_chunk_metadata(self, tmp_path):
+        from rag.infra.stores.docstore_sqlite import SQLiteDocStore
+
+        pipeline = self._make_pipeline_with_mock_enricher(tmp_path)
+        result = pipeline.ingest(self._write_doc(tmp_path))
+        assert result.status == "ok"
+
+        doc_store = SQLiteDocStore(tmp_path / "test.db")
+        chunks = doc_store.get_chunks(result.doc_id)
+        assert chunks
+        assert all(c.metadata.get("title") == "Mock Title" for c in chunks)
+        assert all(c.metadata.get("tags") == ["mock", "tag"] for c in chunks)
+
+    def test_enrich_stage_timing_recorded(self, tmp_path):
+        pipeline = self._make_pipeline_with_mock_enricher(tmp_path)
+        result = pipeline.ingest(self._write_doc(tmp_path))
+        assert "enrich" in result.stage_timings_ms
+        assert result.stage_timings_ms["enrich"] >= 0
+
+    def test_enrich_cost_included_in_cost_usd(self, tmp_path):
+        from rag.infra.llm.pricing import estimate_cost_usd
+
+        pipeline = self._make_pipeline_with_mock_enricher(tmp_path, tokens=(1000, 200))
+        result = pipeline.ingest(self._write_doc(tmp_path))
+        expected = estimate_cost_usd("gpt-4o-mini", 1000, 200)
+        assert result.cost_usd == pytest.approx(expected)
+
+    def test_fold_disabled_leaves_stable_text_unchanged(self, tmp_path):
+        from rag.infra.stores.docstore_sqlite import SQLiteDocStore
+
+        pipeline = self._make_pipeline_with_mock_enricher(tmp_path, fold=False)
+        result = pipeline.ingest(self._write_doc(tmp_path))
+
+        doc_store = SQLiteDocStore(tmp_path / "test.db")
+        chunks = doc_store.get_chunks(result.doc_id)
+        assert all("Mock Title" not in c.stable_text for c in chunks)
+        # Metadata is still populated even though retrieval text is untouched.
+        assert all(c.metadata.get("title") == "Mock Title" for c in chunks)
+
+    def test_fold_enabled_prefixes_stable_text_with_title(self, tmp_path):
+        from rag.infra.stores.docstore_sqlite import SQLiteDocStore
+
+        pipeline = self._make_pipeline_with_mock_enricher(tmp_path, fold=True)
+        result = pipeline.ingest(self._write_doc(tmp_path))
+
+        doc_store = SQLiteDocStore(tmp_path / "test.db")
+        chunks = doc_store.get_chunks(result.doc_id)
+        assert all("Mock Title" in c.stable_text for c in chunks)
+        # token_count must reflect the longer, title-prefixed text.
+        assert all(c.token_count > 0 for c in chunks)
+
+    def test_enricher_failure_falls_back_gracefully_not_ingest_failure(self, tmp_path):
+        # LLMBatchMetadataEnricher already catches per-batch LLM failures
+        # and falls back to rules internally — ingest must still succeed.
+        from rag.infra.chunking.metadata_enricher_llm_batch import LLMEnrichmentSummary
+
+        pipeline = self._make_pipeline_with_mock_enricher(tmp_path)
+
+        def failing_then_fallback(chunks):
+            # Simulates what LLMBatchMetadataEnricher does on LLM failure:
+            # falls back internally, still returns a valid summary.
+            for c in chunks:
+                c.metadata["title"] = "Rules Title"
+            return LLMEnrichmentSummary(results=[], fallback_batches=1)
+
+        pipeline._metadata_enricher.enrich_chunks.side_effect = failing_then_fallback
+        result = pipeline.ingest(self._write_doc(tmp_path))
+        assert result.status == "ok"
+
+
+# ---------------------------------------------------------------------------
 # Batch ingest report
 # ---------------------------------------------------------------------------
 

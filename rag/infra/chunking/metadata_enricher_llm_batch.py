@@ -178,14 +178,13 @@ class LLMBatchMetadataEnricher:
         self, chunks: list[Chunk], summary: LLMEnrichmentSummary
     ) -> list[LLMEnrichmentResult]:
         """Enrich a single batch; falls back to rules on LLM failure."""
-        prompt = self._build_prompt(chunks)
+        user_prompt = self._build_prompt(chunks)
+        # BaseLLMClient.generate() takes a single prompt string, not a
+        # chat-style messages list — concatenate system instructions and
+        # the per-batch content into one prompt to match the real interface.
+        full_prompt = f"{_SYSTEM_PROMPT}\n\n{user_prompt}"
         try:
-            response = self._llm.generate(
-                messages=[
-                    {"role": "system", "content": _SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt},
-                ]
-            )
+            response = self._llm.generate(full_prompt)
             summary.add_usage(response.prompt_tokens, response.completion_tokens)
             results = self._parse_response(response.text, chunks)
 

@@ -55,6 +55,22 @@ def _mock_llm(items: list[dict], prompt_tokens=10, completion_tokens=20) -> Magi
     return llm
 
 
+class _RealSignatureLLMClient:
+    """Implements BaseLLMClient.generate()'s real signature exactly —
+    generate(self, prompt: str, **kwargs) — unlike MagicMock, this raises
+    TypeError on a call shape the real interface doesn't accept. Used to
+    catch interface-mismatch regressions that a loose mock would hide.
+    """
+
+    def __init__(self, response_items: list[dict]):
+        self._response_items = response_items
+        self.received_prompts: list[str] = []
+
+    def generate(self, prompt: str, **kwargs):
+        self.received_prompts.append(prompt)
+        return _make_llm_response(self._response_items)
+
+
 # ---------------------------------------------------------------------------
 # Basic enrichment
 # ---------------------------------------------------------------------------
@@ -94,6 +110,25 @@ class TestLLMBatchEnrichment:
         assert chunk.metadata["title"] == "LLM Title"
         assert chunk.metadata["summary"] == "LLM Summary."
         assert "ai" in chunk.metadata["tags"]
+
+    def test_calls_generate_with_real_base_llm_client_signature(self):
+        # Regression guard: _enrich_batch() previously called
+        # self._llm.generate(messages=[...]) — BaseLLMClient.generate()'s
+        # real signature is generate(self, prompt: str, **kwargs), which
+        # has no `messages` parameter and requires positional `prompt`.
+        # MagicMock accepts any call shape and silently hid this — using a
+        # class with the real signature makes the mismatch a hard TypeError
+        # instead of a masked no-op.
+        llm = _RealSignatureLLMClient([{"title": "T", "summary": "S", "tags": ["x"]}])
+        enricher = LLMBatchMetadataEnricher(llm)
+        chunks = [_make_chunk("Real interface content.", "c1")]
+
+        summary = enricher.enrich_chunks(chunks)
+
+        assert summary.fallback_batches == 0  # no TypeError forced a fallback
+        assert summary.results[0].title == "T"
+        assert len(llm.received_prompts) == 1
+        assert "Real interface content." in llm.received_prompts[0]
 
 
 # ---------------------------------------------------------------------------

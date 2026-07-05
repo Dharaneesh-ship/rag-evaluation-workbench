@@ -21,7 +21,10 @@ from rag.core.interfaces.vector_index import BaseVectorIndex
 from rag.core.utils.hashing import BlockDiffResult, diff_blocks, fingerprint_bytes, make_doc_id
 from rag.infra.cleaning.cleaner_pipeline import CleanerPipeline
 from rag.infra.chunking.block_splitter_paragraph import ParagraphBlockSplitter
-from rag.infra.chunking.chunk_packer_anchor_aware import AnchorAwareChunkPacker
+from rag.infra.chunking.chunk_packer_anchor_aware import (
+    AnchorAwareChunkPacker,
+    _approx_tokens,
+)
 from rag.infra.llm.pricing import estimate_cost_usd
 from rag.infra.loading.local_file_loader import (
     DEFAULT_MAX_FILE_SIZE_BYTES,
@@ -324,6 +327,21 @@ class IngestPipeline:
         max_file_size_bytes: Files larger than this are rejected before being
             read into memory (see ``LocalFileLoader``). Defaults to 500 MB;
             pass ``None`` to disable the check.
+        enrich_metadata: Generate a title/summary/tags per chunk via LLM
+            (``LLMBatchMetadataEnricher``), stored in ``chunk.metadata``.
+            Off by default — this is a real, metered API cost per document
+            on top of parsing/embedding. Falls back to a rules-based
+            enricher automatically if the LLM call fails.
+        enrich_model: OpenAI model id used for metadata enrichment when
+            ``enrich_metadata=True``. Defaults to ``"gpt-4o-mini"``.
+        enrich_fold_into_stable_text: When True, also prefix each chunk's
+            retrievable ``stable_text`` with its generated title, so
+            BM25/embedding indexing can see it (not just chunk-browser
+            display). Only meaningful with ``enrich_metadata=True``; a
+            no-op otherwise. Off by default — changes retrieval behavior,
+            so it should be a deliberate, measured choice (see
+            scripts/asqa_eval.py's ``--enrich`` flag for an A/B comparison
+            against a baseline without enrichment).
     """
 
     # Default guardrail thresholds (used when no config file is found)
@@ -346,6 +364,9 @@ class IngestPipeline:
         index_dir: str | Path | None = None,
         vision_model: str = "gpt-4o-mini",
         max_file_size_bytes: int | None = DEFAULT_MAX_FILE_SIZE_BYTES,
+        enrich_metadata: bool = False,
+        enrich_model: str = "gpt-4o-mini",
+        enrich_fold_into_stable_text: bool = False,
     ) -> None:
         self._doc_store = doc_store
         self._trace_store = trace_store
@@ -353,6 +374,21 @@ class IngestPipeline:
         self._vector_index = vector_index
         self._keyword_index = keyword_index
         self._index_dir = Path(index_dir) if index_dir else None
+
+        # LLM metadata enrichment (title/summary/tags per chunk) — opt-in
+        # and off by default since it costs real API tokens per document.
+        self._enrich_model = enrich_model
+        self._enrich_fold_into_stable_text = enrich_fold_into_stable_text
+        self._metadata_enricher = None
+        if enrich_metadata:
+            from rag.infra.chunking.metadata_enricher_llm_batch import (
+                LLMBatchMetadataEnricher,
+            )
+            from rag.infra.llm.openai_llm_client import OpenAILLMClient
+
+            self._metadata_enricher = LLMBatchMetadataEnricher(
+                OpenAILLMClient(model=enrich_model)
+            )
 
         self._loader = LocalFileLoader(max_file_size_bytes=max_file_size_bytes)
         self._sniffer = CompositeSniffer()
@@ -946,6 +982,41 @@ class IngestPipeline:
         ]
         timings["chunk"] = (time.monotonic() - t0) * 1000  # split + pack combined
 
+        # 8b. Metadata enrichment (optional) — generates title/summary/tags
+        # per chunk via LLM. Pure computation over already-built Chunk
+        # objects (no shared state touched), so this is safe inside
+        # _prepare() and benefits from ingest_many()'s file-level
+        # concurrency the same way parsing/embedding do.
+        enrich_cost_usd = 0.0
+        if self._metadata_enricher is not None and chunks:
+            t0 = time.monotonic()
+            enrich_summary = self._metadata_enricher.enrich_chunks(chunks)
+            timings["enrich"] = (time.monotonic() - t0) * 1000
+            enrich_cost_usd = estimate_cost_usd(
+                self._enrich_model,
+                enrich_summary.prompt_tokens,
+                enrich_summary.completion_tokens,
+            )
+            if self._enrich_fold_into_stable_text:
+                # Prefix the generated title onto stable_text so BM25/
+                # embedding indexing can actually see it, not just the
+                # chunk-browser display — a deliberate, measured choice
+                # since it changes retrieval behavior (see enrich_fold_into_
+                # stable_text's docstring for the A/B methodology).
+                folded = []
+                for c in chunks:
+                    title = c.metadata.get("title", "")
+                    new_text = f"{title}\n\n{c.stable_text}".strip() if title else c.stable_text
+                    folded.append(
+                        c.model_copy(
+                            update={
+                                "stable_text": new_text,
+                                "token_count": _approx_tokens(new_text),
+                            }
+                        )
+                    )
+                chunks = folded
+
         # 9. Embed (optional). Indexing (keyword_index.add / vector_index.add)
         # happens in _commit() — it mutates the shared in-memory index and
         # must run on a single thread.
@@ -983,7 +1054,7 @@ class IngestPipeline:
         # usage and cost in Document.metadata (captured during step 3/"parse"
         # above) since it happens inside the orchestrator, not here.
         vision_cost_usd = document.metadata.get("vision_cost_usd", 0.0)
-        cost_usd = embed_cost_usd + vision_cost_usd
+        cost_usd = embed_cost_usd + vision_cost_usd + enrich_cost_usd
 
         return _Prepared(
             doc_id=doc_id,

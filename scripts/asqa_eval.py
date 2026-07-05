@@ -202,6 +202,8 @@ def _ingest_corpus(
     index_dir: Path,
     token_budget: int,
     embedding: str,
+    enrich: bool = False,
+    enrich_fold: bool = False,
 ) -> tuple["QueryPipeline", dict]:  # noqa: F821
     """Ingest cached HTML pages into an isolated BM25 (+FAISS) index.
 
@@ -211,6 +213,12 @@ def _ingest_corpus(
         index_dir: Directory to persist BM25/FAISS indexes.
         token_budget: Chunk token budget for this ingest run.
         embedding: "none" | "openai" | "multilingual".
+        enrich: Generate title/summary/tags per chunk via LLM
+            (real API cost — gpt-4o-mini, ~$0.001-0.002/doc).
+        enrich_fold: Also prefix each chunk's retrievable text with its
+            generated title, so the enrichment can actually affect
+            BM25/embedding recall (not just chunk-browser display). Only
+            meaningful combined with ``enrich=True``.
 
     Returns:
         ``(query_pipeline, ingest_stats)`` — a ready QueryPipeline over the
@@ -235,7 +243,7 @@ def _ingest_corpus(
         from rag.infra.embedding.openai_embedding import OpenAIEmbeddingProvider
 
         embedding_provider = OpenAIEmbeddingProvider(
-            model="text-embedding-3-small", dimensions=1536
+            model="text-embedding-3-small", dim=1536
         )
         vector_index = FaissLocalIndex()
     elif embedding == "multilingual":
@@ -258,15 +266,18 @@ def _ingest_corpus(
         vector_index=vector_index,
         keyword_index=keyword_index,
         index_dir=index_dir,
+        enrich_metadata=enrich,
+        enrich_fold_into_stable_text=enrich_fold,
     )
 
-    stats = {"ok": 0, "skipped": 0, "failed": 0, "other": 0}
+    stats = {"ok": 0, "skipped": 0, "failed": 0, "other": 0, "cost_usd": 0.0}
     for i, (path, title) in enumerate(pages, start=1):
         canonical = f"{title}.html"
         try:
             result = pipeline.ingest(str(path), canonical_name=canonical)
             status = getattr(result, "status", "ok")
             stats[status if status in ("ok", "skipped", "failed") else "other"] += 1
+            stats["cost_usd"] += getattr(result, "cost_usd", 0.0)
         except Exception as exc:
             logger.warning("Ingest failed for '%s': %s", title, exc)
             stats["failed"] += 1
@@ -366,8 +377,25 @@ def main() -> None:
     parser.add_argument(
         "--force-refetch", action="store_true", help="Re-download pages even if cached."
     )
+    parser.add_argument(
+        "--enrich",
+        action="store_true",
+        help="Generate title/summary/tags per chunk via LLM (gpt-4o-mini, "
+        "real API cost, ~$0.001-0.002/doc). Written to chunk metadata only "
+        "unless --enrich-fold is also passed.",
+    )
+    parser.add_argument(
+        "--enrich-fold",
+        action="store_true",
+        help="Also prefix each chunk's retrievable text with its generated "
+        "title, so enrichment can actually move BM25/embedding recall "
+        "(not just chunk-browser display). Requires --enrich.",
+    )
     parser.add_argument("--output", type=Path, default=None, help="Save results JSON to this path.")
     args = parser.parse_args()
+
+    if args.enrich_fold and not args.enrich:
+        parser.error("--enrich-fold requires --enrich")
 
     from dotenv import load_dotenv
 
@@ -381,15 +409,20 @@ def main() -> None:
     corpus_dir = args.data_dir / "corpus"
     pages = _fetch_corpus(urls, corpus_dir, args.force_refetch)
 
-    # Suffix the DB/index path by embedding mode so switching --embedding
-    # on the same token_budget never collides with an existing DB (which
-    # would otherwise "skip" unchanged docs and leave a freshly-constructed,
-    # empty in-process index unpopulated for this run).
+    # Suffix the DB/index path by embedding mode (and enrichment mode) so
+    # switching configs on the same token_budget never collides with an
+    # existing DB (which would otherwise "skip" unchanged docs and leave a
+    # freshly-constructed, empty in-process index unpopulated for this run).
     suffix = "" if args.embedding == "none" else f"_{args.embedding}"
+    if args.enrich_fold:
+        suffix += "_enrichfold"
+    elif args.enrich:
+        suffix += "_enrich"
     db_path = args.data_dir / f"tb{args.token_budget}{suffix}.db"
     index_dir = args.data_dir / f"tb{args.token_budget}{suffix}_indexes"
     query_pipeline, ingest_stats = _ingest_corpus(
-        pages, db_path, index_dir, args.token_budget, args.embedding
+        pages, db_path, index_dir, args.token_budget, args.embedding,
+        enrich=args.enrich, enrich_fold=args.enrich_fold,
     )
 
     scores = _score(query_pipeline, units, args.top_k)
@@ -414,6 +447,8 @@ def main() -> None:
                 "token_budget": args.token_budget,
                 "top_k": args.top_k,
                 "embedding": args.embedding,
+                "enrich": args.enrich,
+                "enrich_fold": args.enrich_fold,
             },
             "ingest_stats": ingest_stats,
             "n_corpus_urls": len(urls),
