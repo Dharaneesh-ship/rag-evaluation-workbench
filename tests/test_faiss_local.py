@@ -161,3 +161,54 @@ def test_add_chunk_without_chunk_id_raises() -> None:
     )
     with pytest.raises(ValueError, match="chunk_id"):
         idx.add([chunk])
+
+
+# ── Deferred rebuild (batch ingest throughput) ─────────────────────────────────
+
+
+def test_add_with_rebuild_false_not_searchable_until_rebuild(three_chunks):
+    idx = FaissLocalIndex()
+    idx.add(three_chunks, rebuild=False)
+    assert idx.dimension == 0  # index not built yet
+    assert idx.search(_VEC_A, top_k=3) == []
+
+    idx.rebuild()
+    assert idx.dimension == 3
+    results = idx.search(_VEC_A, top_k=3)
+    assert len(results) == 3
+
+
+def test_multiple_deferred_adds_then_single_rebuild(three_chunks):
+    idx = FaissLocalIndex()
+    for chunk in three_chunks:
+        idx.add([chunk], rebuild=False)
+    assert idx.dimension == 0
+
+    idx.rebuild()
+    results = idx.search(_VEC_A, top_k=1)
+    assert results[0].chunk_id == "chunk-a"
+
+
+def test_add_default_rebuild_true_matches_prior_behavior(three_chunks):
+    idx = FaissLocalIndex()
+    idx.add(three_chunks)  # rebuild defaults to True
+    assert idx.dimension == 3
+    assert len(idx.search(_VEC_A, top_k=3)) == 3
+
+
+def test_deferred_add_does_not_rebuild_per_call(three_chunks):
+    idx = FaissLocalIndex()
+    call_count = {"n": 0}
+    original_rebuild = idx._rebuild
+
+    def counting_rebuild():
+        call_count["n"] += 1
+        original_rebuild()
+
+    idx._rebuild = counting_rebuild
+    for chunk in three_chunks:
+        idx.add([chunk], rebuild=False)
+    assert call_count["n"] == 0
+
+    idx.rebuild()
+    assert call_count["n"] == 1

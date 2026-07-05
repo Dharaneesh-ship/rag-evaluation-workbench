@@ -104,14 +104,27 @@ class BM25LocalIndex(BaseKeywordIndex):
 
     # ── BaseKeywordIndex ──────────────────────────────────────────────────────
 
-    def add(self, chunks: list[Chunk]) -> None:
+    def add(self, chunks: list[Chunk], rebuild: bool = True) -> None:
         """Add chunks to the index.
 
         Args:
             chunks: Chunks to add. Existing chunks are not deduplicated here;
                 callers should avoid adding the same chunk_id twice.
+            rebuild: Retokenize and rebuild the BM25 model immediately.
+                Pass ``False`` when adding many batches in a loop and call
+                :meth:`rebuild` once afterwards — rebuilding retokenizes
+                every chunk added so far, so doing it on every call makes a
+                batch of N documents O(N^2) instead of O(N).
         """
         self._chunks.extend(chunks)
+        if rebuild:
+            self._rebuild()
+
+    def rebuild(self) -> None:
+        """Rebuild the BM25 model from all chunks added so far.
+
+        Call this once after a batch of ``add(..., rebuild=False)`` calls.
+        """
         self._rebuild()
 
     def search(

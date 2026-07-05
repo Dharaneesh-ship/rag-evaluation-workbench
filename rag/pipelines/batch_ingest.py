@@ -159,6 +159,7 @@ class BatchIngestRunner:
         root: str | Path,
         recursive: bool = True,
         progress: bool = False,
+        workers: int = 1,
     ) -> BatchIngestReport:
         """Ingest all files under ``root`` and return the aggregated report.
 
@@ -166,6 +167,10 @@ class BatchIngestRunner:
             root: Directory containing the files to ingest.
             recursive: Descend into subdirectories. Defaults to True.
             progress: Print one line per file while running.
+            workers: Concurrent prepare-phase threads (parse/clean/chunk/
+                embed). ``1`` ingests sequentially. DocStore writes and
+                index updates always run one file at a time regardless of
+                this setting — see ``IngestPipeline.ingest_many()``.
 
         Returns:
             BatchIngestReport with one entry per discovered file.
@@ -174,13 +179,21 @@ class BatchIngestRunner:
         files = discover_files(root, recursive=recursive)
         report = BatchIngestReport(root=str(root))
 
-        for i, path in enumerate(files, start=1):
-            if progress:
-                print(f"[{i}/{len(files)}] {path.name} ...", flush=True)
-            # IngestPipeline.ingest() catches its own exceptions and returns
-            # status="failed" — one bad file never aborts the batch.
-            result = self._pipeline.ingest(path)
-            report.results.append(result)
+        if progress:
+            print(f"Ingesting {len(files)} file(s) (workers={workers})...", flush=True)
+
+        # Batch mode defers index rebuild/disk-save from "every document" to
+        # "once at the end" — see IngestPipeline.begin_batch() docstring for
+        # why the naive per-document version is O(N^2) for N documents.
+        self._pipeline.begin_batch()
+        try:
+            report.results = self._pipeline.ingest_many(files, max_workers=workers)
+        finally:
+            self._pipeline.end_batch()
+
+        if progress:
+            for i, (path, result) in enumerate(zip(files, report.results), start=1):
+                print(f"[{i}/{len(files)}] {path.name}: {result.status}", flush=True)
 
         if self._trace_store is not None:
             self._trace_store.save_run(

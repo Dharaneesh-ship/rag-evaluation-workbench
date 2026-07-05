@@ -2,6 +2,7 @@
 
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -239,6 +240,29 @@ class IngestResult:
     diff_available: bool = False
 
 
+@dataclass
+class _Prepared:
+    """Output of IngestPipeline._prepare() — everything _commit() needs.
+
+    Bundles the results of the pure-computation stages (load, parse, clean,
+    split, pack, embed) so they can be produced concurrently across worker
+    threads (see ``ingest_many``) and then committed to the DocStore and
+    keyword/vector indexes one at a time on a single thread.
+    """
+
+    doc_id: str
+    canonical: str
+    source_path: str
+    document: Any
+    text_blocks: list
+    chunks: list
+    embed_tokens: int
+    status: str
+    prev_doc_id: str | None
+    prev_chunk_ids: list[str]
+    block_diff: Optional[BlockDiffResult]
+
+
 class IngestPipeline:
     """End-to-end document ingestion pipeline.
 
@@ -349,6 +373,47 @@ class IngestPipeline:
         self._warn_threshold, self._error_threshold = self._load_guardrail_config(
             resync_config_path
         )
+
+        # Batch mode (see begin_batch/end_batch): defers index rebuild and
+        # disk persistence from "every document" to "once at the end of the
+        # batch" — rebuilding BM25/FAISS after each add() is O(total chunks
+        # so far), so doing it per-document makes an N-document batch O(N^2).
+        self._batch_mode = False
+
+    def begin_batch(self) -> None:
+        """Enter batch mode: defer index rebuild and disk persistence.
+
+        While active, ``_run()`` adds chunks to the keyword/vector indexes
+        with ``rebuild=False`` and skips the per-document disk save. Call
+        :meth:`end_batch` when done to rebuild the indexes once and persist
+        them — this turns an O(N^2) rebuild cost (retokenizing/reconstructing
+        the whole index after every document) into O(N) for a batch of N
+        documents. Safe to call even with no keyword/vector index configured.
+        """
+        self._batch_mode = True
+
+    def end_batch(self) -> None:
+        """Exit batch mode: rebuild indexes once and persist them to disk.
+
+        No-op (but safe) if ``begin_batch`` was never called or no
+        keyword/vector index is configured.
+        """
+        self._batch_mode = False
+        if self._keyword_index is not None:
+            self._keyword_index.rebuild()
+        if self._vector_index is not None:
+            self._vector_index.rebuild()
+        self._persist_indexes()
+
+    def _persist_indexes(self) -> None:
+        """Save the keyword/vector indexes to ``self._index_dir``, if configured."""
+        if self._index_dir and (self._keyword_index is not None or self._vector_index is not None):
+            self._index_dir.mkdir(parents=True, exist_ok=True)
+            if self._keyword_index is not None:
+                self._keyword_index.save(str(self._index_dir / "bm25.index"))
+            if self._vector_index is not None:
+                self._vector_index.save(str(self._index_dir / "faiss.index"))
+            logger.debug("Saved updated indexes to '%s'", self._index_dir)
 
     def _load_guardrail_config(
         self, config_path: str | Path | None
@@ -507,13 +572,135 @@ class IngestPipeline:
         )
         return result
 
+    def ingest_many(
+        self,
+        paths: list[str | Path],
+        canonical_names: Optional[list[Optional[str]]] = None,
+        max_workers: int = 1,
+    ) -> list[IngestResult]:
+        """Ingest many files, parsing/cleaning/chunking concurrently.
+
+        The expensive, side-effect-free stages (file load, parse, clean,
+        split, pack, embed — everything in ``_prepare()``) run across up to
+        ``max_workers`` threads at once, since they only read from the
+        DocStore (a fresh SQLite connection per call, safe from any thread)
+        and touch no shared mutable state. The DocStore writes and keyword/
+        vector index updates (``_commit()``) still run one file at a time,
+        in original file order, on the calling thread — SQLite's
+        single-writer model and the in-memory BM25/FAISS index objects are
+        not safe to mutate concurrently.
+
+        Wrap the whole batch in ``begin_batch()``/``end_batch()`` (as
+        ``BatchIngestRunner`` does) to also avoid rebuilding the keyword/
+        vector index after every document.
+
+        Args:
+            paths: File paths to ingest, in the order results should be
+                reported.
+            canonical_names: Optional per-path canonical name overrides
+                (same meaning as ``ingest()``'s ``canonical_name``). Must be
+                the same length as ``paths`` if given; use None entries for
+                paths that should default to their own resolved path.
+            max_workers: Number of concurrent prepare-phase threads.
+                ``1`` runs fully sequentially (no thread pool overhead) and
+                is equivalent to calling ``ingest()`` in a loop.
+
+        Returns:
+            One IngestResult per path, in the same order as ``paths``.
+        """
+        if canonical_names is None:
+            canonical_names = [None] * len(paths)
+        if len(canonical_names) != len(paths):
+            raise ValueError("canonical_names must be the same length as paths")
+
+        jobs = []
+        for path, canonical_name in zip(paths, canonical_names):
+            resolved = str(Path(path).resolve())
+            canonical = canonical_name if canonical_name else resolved
+            run_id = self._trace_store.save_run(
+                run_type="ingest", metadata={"source_path": canonical}
+            )
+            jobs.append((resolved, canonical, run_id))
+
+        def _prepare_job(resolved: str, canonical: str, run_id: str):
+            start = time.monotonic()
+            try:
+                prepared = self._prepare(resolved, run_id, canonical_name=canonical)
+            except Exception as exc:
+                logger.exception("Ingest failed for '%s': %s", canonical, exc)
+                prepared = IngestResult(
+                    doc_id="",
+                    source_path=canonical,
+                    run_id=run_id,
+                    error=str(exc),
+                    status="failed",
+                )
+            return prepared, start
+
+        if max_workers <= 1:
+            prepared_results = [_prepare_job(*job[:2], job[2]) for job in jobs]
+        else:
+            prepared_results = [None] * len(jobs)
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_index = {
+                    executor.submit(_prepare_job, resolved, canonical, run_id): i
+                    for i, (resolved, canonical, run_id) in enumerate(jobs)
+                }
+                for future in as_completed(future_to_index):
+                    prepared_results[future_to_index[future]] = future.result()
+
+        # Commit sequentially, in original file order, on this thread —
+        # this is the single-writer section (DocStore + shared indexes).
+        results: list[IngestResult] = []
+        for (resolved, canonical, run_id), (prepared, start) in zip(jobs, prepared_results):
+            if isinstance(prepared, IngestResult):
+                result = prepared
+            else:
+                try:
+                    result = self._commit(prepared, run_id)
+                except Exception as exc:
+                    logger.exception("Ingest commit failed for '%s': %s", canonical, exc)
+                    result = IngestResult(
+                        doc_id=prepared.doc_id,
+                        source_path=canonical,
+                        run_id=run_id,
+                        error=str(exc),
+                        status="failed",
+                    )
+
+            result.elapsed_ms = (time.monotonic() - start) * 1000
+            self._trace_store.save_run(
+                run_type="ingest_complete",
+                metadata={
+                    "source_path": canonical,
+                    "run_id": run_id,
+                    "doc_id": result.doc_id,
+                    "block_count": result.block_count,
+                    "chunk_count": result.chunk_count,
+                    "embed_tokens": result.embed_tokens,
+                    "elapsed_ms": result.elapsed_ms,
+                    "error": result.error,
+                    "status": result.status,
+                },
+            )
+            results.append(result)
+
+        return results
+
     def _run(
         self,
         source_path: str,
         run_id: str,
         canonical_name: str | None = None,
     ) -> IngestResult:
-        """Internal pipeline execution — all stages.
+        """Internal pipeline execution — all stages, single-threaded.
+
+        Split into ``_prepare()`` (pure computation: load, parse, clean,
+        split, pack, embed) followed by ``_commit()`` (DocStore writes and
+        index updates). For a single file these run back-to-back on the
+        same thread with identical behavior to before the split; see
+        ``ingest_many()`` for the concurrent-prepare / serial-commit path
+        used by batch ingestion.
 
         Args:
             source_path: Resolved absolute path to the source file to read.
@@ -525,6 +712,36 @@ class IngestPipeline:
 
         Raises:
             Exception: On any unrecoverable pipeline error.
+        """
+        prepared = self._prepare(source_path, run_id, canonical_name=canonical_name)
+        if isinstance(prepared, IngestResult):
+            return prepared
+        return self._commit(prepared, run_id)
+
+    def _prepare(
+        self,
+        source_path: str,
+        run_id: str,
+        canonical_name: str | None = None,
+    ) -> "_Prepared | IngestResult":
+        """Pure-computation stages: load, parse, clean, split, pack, embed.
+
+        Touches no shared mutable state (no DocStore writes, no keyword/
+        vector index updates) — every DocStore call here is a read (fresh
+        SQLite connection per call, safe from any thread), and the only
+        write-adjacent call is the guardrail check, which only appends a
+        trace event. This makes ``_prepare`` safe to run concurrently
+        across worker threads for different files (see ``ingest_many``).
+
+        Args:
+            source_path: Resolved absolute path to the source file to read.
+            run_id: TraceStore run identifier (already allocated by the caller).
+            canonical_name: Stable key for DocStore lookups (default: source_path).
+
+        Returns:
+            A ``_Prepared`` bundle for ``_commit()``, or a terminal
+            ``IngestResult`` directly for early-exit outcomes (skipped /
+            unsupported format) that need no commit phase at all.
         """
         # canonical is the stable identity key used for deduplication and
         # stale-chunk lookup. When the file is a temp upload, canonical_name
@@ -612,9 +829,6 @@ class IngestPipeline:
                     prev_doc_id,
                 )
 
-        # 5. Store document
-        self._doc_store.save_document(document)
-
         # 6. Clean
         cleaned_blocks = self._cleaner.run(document.blocks)
 
@@ -636,10 +850,10 @@ class IngestPipeline:
                     block_diff.removed_count,
                     block_diff.unchanged_count,
                 )
-                # 7c. Guardrail check — warn/error if change ratio exceeds thresholds
+                # 7c. Guardrail check — warn/error if change ratio exceeds thresholds.
+                # Only appends a trace event (fresh connection per call) —
+                # safe to run from a worker thread.
                 self._check_resync_guardrails(block_diff, canonical, run_id)
-
-        self._doc_store.save_text_blocks(text_blocks)
 
         # 8. Pack into Chunks
         chunks = self._packer.pack(text_blocks)
@@ -651,10 +865,9 @@ class IngestPipeline:
             for c in chunks
         ]
 
-        # 9. Embed (optional) + index
-        # Keyword (BM25) indexing needs no vectors, so it must not be gated on
-        # embedding_provider — BM25-only mode (embedding_provider=None) is a
-        # supported configuration and must still populate the keyword index.
+        # 9. Embed (optional). Indexing (keyword_index.add / vector_index.add)
+        # happens in _commit() — it mutates the shared in-memory index and
+        # must run on a single thread.
         embed_tokens = 0
         if self._embedding_provider is not None and chunks:
             texts = [c.stable_text for c in chunks]
@@ -679,11 +892,62 @@ class IngestPipeline:
                 "Embedded %d chunks using %d tokens.", len(chunks), embed_tokens
             )
 
+        return _Prepared(
+            doc_id=doc_id,
+            canonical=canonical,
+            source_path=source_path,
+            document=document,
+            text_blocks=text_blocks,
+            chunks=chunks,
+            embed_tokens=embed_tokens,
+            status=status,
+            prev_doc_id=prev_doc_id,
+            prev_chunk_ids=prev_chunk_ids,
+            block_diff=block_diff,
+        )
+
+    def _commit(self, prepared: "_Prepared", run_id: str) -> IngestResult:
+        """DocStore writes and index updates for a prepared document.
+
+        Must be called from a single thread only — this is where the
+        shared keyword/vector index objects and the DocStore are mutated.
+        Batch callers (``ingest_many``) call this sequentially on the
+        calling thread even when ``_prepare`` ran concurrently.
+
+        Args:
+            prepared: Output of ``_prepare()`` for one document.
+            run_id: TraceStore run identifier for this document.
+
+        Returns:
+            Populated IngestResult.
+        """
+        doc_id = prepared.doc_id
+        canonical = prepared.canonical
+        source_path = prepared.source_path
+        document = prepared.document
+        text_blocks = prepared.text_blocks
+        chunks = prepared.chunks
+        embed_tokens = prepared.embed_tokens
+        status = prepared.status
+        prev_doc_id = prepared.prev_doc_id
+        prev_chunk_ids = prepared.prev_chunk_ids
+        block_diff = prepared.block_diff
+
+        # 5. Store document
+        self._doc_store.save_document(document)
+
+        self._doc_store.save_text_blocks(text_blocks)
+
+        # 9. Index
+        # Keyword (BM25) indexing needs no vectors, so it must not be gated on
+        # embedding_provider — BM25-only mode (embedding_provider=None) is a
+        # supported configuration and must still populate the keyword index.
+        if self._embedding_provider is not None and chunks:
             if self._vector_index is not None:
-                self._vector_index.add(chunks)
+                self._vector_index.add(chunks, rebuild=not self._batch_mode)
 
         if self._keyword_index is not None and chunks:
-            self._keyword_index.add(chunks)
+            self._keyword_index.add(chunks, rebuild=not self._batch_mode)
 
         self._doc_store.save_chunks(chunks)
 
@@ -708,14 +972,11 @@ class IngestPipeline:
                 source_path,
             )
 
-        # 9c. Persist updated indexes to disk (Task 11.5)
-        if self._index_dir and (self._keyword_index is not None or self._vector_index is not None):
-            self._index_dir.mkdir(parents=True, exist_ok=True)
-            if self._keyword_index is not None:
-                self._keyword_index.save(str(self._index_dir / "bm25.index"))
-            if self._vector_index is not None:
-                self._vector_index.save(str(self._index_dir / "faiss.index"))
-            logger.debug("Saved updated indexes to '%s'", self._index_dir)
+        # 9c. Persist updated indexes to disk (Task 11.5) — deferred to
+        # end_batch() when a batch is in progress, so a batch of N documents
+        # writes the full index to disk once instead of N times.
+        if not self._batch_mode:
+            self._persist_indexes()
 
         # 9d. Delete old document version from DocStore (Task 11.5)
         if prev_doc_id and prev_doc_id != doc_id:

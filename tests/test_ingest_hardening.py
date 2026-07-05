@@ -439,6 +439,231 @@ class TestKeywordIndexIndependentOfEmbedding:
 
 
 # ---------------------------------------------------------------------------
+# Batch mode: deferred index rebuild/persistence (O(N^2) -> O(N) fix)
+# ---------------------------------------------------------------------------
+
+
+class TestBatchMode:
+    def _make_pipeline(self, tmp_path, index_dir=None):
+        from rag.infra.indexes.bm25_local import BM25LocalIndex
+        from rag.infra.stores.docstore_sqlite import SQLiteDocStore
+        from rag.infra.stores.tracestore_sqlite import SQLiteTraceStore
+        from rag.pipelines.ingest_pipeline import IngestPipeline
+
+        db = tmp_path / "test.db"
+        keyword_index = BM25LocalIndex()
+        pipeline = IngestPipeline(
+            SQLiteDocStore(db),
+            SQLiteTraceStore(db),
+            keyword_index=keyword_index,
+            embedding_provider=None,
+            index_dir=index_dir,
+        )
+        return pipeline, keyword_index
+
+    def _write_docs(self, tmp_path, n):
+        paths = []
+        for i in range(n):
+            f = tmp_path / f"doc{i}.md"
+            f.write_text(
+                f"# Title {i}\n\nContent number {i} about cats and dogs, "
+                "with enough words to clear the quality gate threshold."
+            )
+            paths.append(f)
+        return paths
+
+    def test_rebuild_deferred_during_batch_and_applied_at_end(self, tmp_path):
+        pipeline, keyword_index = self._make_pipeline(tmp_path)
+        paths = self._write_docs(tmp_path, 5)
+
+        pipeline.begin_batch()
+        for p in paths:
+            result = pipeline.ingest(p)
+            assert result.status == "ok"
+            # Mid-batch: chunks are recorded but the BM25 model isn't
+            # rebuilt yet, so search returns nothing until end_batch().
+            assert keyword_index._bm25 is None
+        pipeline.end_batch()
+
+        assert keyword_index._bm25 is not None
+        assert keyword_index.search("cats and dogs", top_k=10)
+
+    def test_rebuild_called_once_per_batch_not_per_document(self, tmp_path):
+        pipeline, keyword_index = self._make_pipeline(tmp_path)
+        paths = self._write_docs(tmp_path, 5)
+
+        call_count = {"n": 0}
+        original_rebuild = keyword_index._rebuild
+
+        def counting_rebuild():
+            call_count["n"] += 1
+            original_rebuild()
+
+        keyword_index._rebuild = counting_rebuild
+
+        pipeline.begin_batch()
+        for p in paths:
+            pipeline.ingest(p)
+        assert call_count["n"] == 0  # zero rebuilds mid-batch
+        pipeline.end_batch()
+        assert call_count["n"] == 1  # exactly one rebuild at the end
+
+    def test_index_persisted_once_at_end_batch_not_per_document(self, tmp_path):
+        index_dir = tmp_path / "indexes"
+        pipeline, keyword_index = self._make_pipeline(tmp_path, index_dir=index_dir)
+        paths = self._write_docs(tmp_path, 4)
+
+        save_calls = {"n": 0}
+        original_save = keyword_index.save
+
+        def counting_save(path):
+            save_calls["n"] += 1
+            original_save(path)
+
+        keyword_index.save = counting_save
+
+        pipeline.begin_batch()
+        for p in paths:
+            pipeline.ingest(p)
+        assert save_calls["n"] == 0  # no disk writes mid-batch
+        pipeline.end_batch()
+        assert save_calls["n"] == 1  # exactly one disk write at the end
+        assert (index_dir / "bm25.index").exists()
+
+    def test_single_document_ingest_unaffected_by_batch_mode(self, tmp_path):
+        # Outside begin_batch/end_batch, behavior must be identical to before:
+        # every ingest() call rebuilds and is immediately searchable.
+        pipeline, keyword_index = self._make_pipeline(tmp_path)
+        f = tmp_path / "doc.md"
+        f.write_text("# Title\n\nContent about cats and dogs with enough words.")
+
+        result = pipeline.ingest(f)
+
+        assert result.status == "ok"
+        assert keyword_index._bm25 is not None
+        assert keyword_index.search("cats and dogs", top_k=5)
+
+    def test_end_batch_without_begin_batch_is_safe_noop(self, tmp_path):
+        pipeline, _ = self._make_pipeline(tmp_path)
+        pipeline.end_batch()  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# ingest_many: concurrent prepare, serial commit
+# ---------------------------------------------------------------------------
+
+
+class TestIngestMany:
+    def _make_pipeline(self, tmp_path):
+        from rag.infra.indexes.bm25_local import BM25LocalIndex
+        from rag.infra.stores.docstore_sqlite import SQLiteDocStore
+        from rag.infra.stores.tracestore_sqlite import SQLiteTraceStore
+        from rag.pipelines.ingest_pipeline import IngestPipeline
+
+        db = tmp_path / "test.db"
+        keyword_index = BM25LocalIndex()
+        pipeline = IngestPipeline(
+            SQLiteDocStore(db),
+            SQLiteTraceStore(db),
+            keyword_index=keyword_index,
+            embedding_provider=None,
+        )
+        return pipeline, keyword_index
+
+    def _write_docs(self, tmp_path, n):
+        paths = []
+        for i in range(n):
+            f = tmp_path / f"doc{i}.md"
+            f.write_text(
+                f"# Title {i}\n\nContent number {i} about cats and dogs, "
+                "with enough words to clear the quality gate threshold."
+            )
+            paths.append(f)
+        return paths
+
+    def test_sequential_max_workers_1_matches_ingest_loop(self, tmp_path):
+        pipeline, keyword_index = self._make_pipeline(tmp_path)
+        paths = self._write_docs(tmp_path, 5)
+
+        results = pipeline.ingest_many(paths, max_workers=1)
+
+        assert [r.status for r in results] == ["ok"] * 5
+        assert len(keyword_index._chunks) == sum(r.chunk_count for r in results)
+        assert keyword_index.search("cats and dogs", top_k=10)
+
+    def test_concurrent_prepare_all_documents_committed(self, tmp_path):
+        pipeline, keyword_index = self._make_pipeline(tmp_path)
+        paths = self._write_docs(tmp_path, 12)
+
+        results = pipeline.ingest_many(paths, max_workers=4)
+
+        assert [r.status for r in results] == ["ok"] * 12
+        assert len({r.doc_id for r in results}) == 12  # all distinct, none lost
+        assert len(keyword_index._chunks) == sum(r.chunk_count for r in results)
+        for i in range(12):
+            assert keyword_index.search(f"number {i}", top_k=20)
+
+    def test_results_returned_in_original_file_order(self, tmp_path, monkeypatch):
+        # Worker threads may finish out of order; results must still line up
+        # with the input paths list, not completion order.
+        pipeline, _ = self._make_pipeline(tmp_path)
+        paths = self._write_docs(tmp_path, 6)
+
+        import random
+        import time as time_mod
+        from pathlib import Path as _Path
+
+        original_prepare = pipeline._prepare
+        delays = {str(_Path(p).resolve()): random.Random(42).random() * 0.02 for p in paths}
+
+        def jittered_prepare(source_path, run_id, canonical_name=None):
+            time_mod.sleep(delays.get(source_path, 0))
+            return original_prepare(source_path, run_id, canonical_name=canonical_name)
+
+        monkeypatch.setattr(pipeline, "_prepare", jittered_prepare)
+
+        results = pipeline.ingest_many(paths, max_workers=6)
+        expected_order = [f"doc{i}.md" for i in range(6)]
+        actual_order = [_Path(r.source_path).name for r in results]
+        assert actual_order == expected_order
+
+    def test_one_file_failure_does_not_affect_others(self, tmp_path):
+        pipeline, keyword_index = self._make_pipeline(tmp_path)
+        paths = self._write_docs(tmp_path, 4)
+        missing = tmp_path / "does_not_exist.md"
+        paths.insert(2, missing)  # inject a bad path in the middle
+
+        results = pipeline.ingest_many(paths, max_workers=3)
+
+        statuses = [r.status for r in results]
+        assert statuses == ["ok", "ok", "failed", "ok", "ok"]
+        assert results[2].error is not None
+        # The three good docs are still fully indexed despite the failure.
+        assert len(keyword_index._chunks) == sum(
+            r.chunk_count for r in results if r.status == "ok"
+        )
+
+    def test_canonical_names_length_mismatch_raises(self, tmp_path):
+        pipeline, _ = self._make_pipeline(tmp_path)
+        paths = self._write_docs(tmp_path, 2)
+        with pytest.raises(ValueError):
+            pipeline.ingest_many(paths, canonical_names=["only-one"])
+
+    def test_combined_with_batch_mode_defers_rebuild(self, tmp_path):
+        pipeline, keyword_index = self._make_pipeline(tmp_path)
+        paths = self._write_docs(tmp_path, 8)
+
+        pipeline.begin_batch()
+        results = pipeline.ingest_many(paths, max_workers=4)
+        assert keyword_index._bm25 is None  # not rebuilt until end_batch
+        pipeline.end_batch()
+
+        assert [r.status for r in results] == ["ok"] * 8
+        assert keyword_index._bm25 is not None
+        assert keyword_index.search("cats and dogs", top_k=20)
+
+
+# ---------------------------------------------------------------------------
 # Batch ingest report
 # ---------------------------------------------------------------------------
 

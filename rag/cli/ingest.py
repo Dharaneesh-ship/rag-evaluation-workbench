@@ -6,6 +6,7 @@ Usage::
     python -m rag.cli.ingest --path document.pdf --collection my_collection
     python -m rag.cli.ingest --path ./docs                # whole directory
     python -m rag.cli.ingest --path ./docs --no-recursive
+    python -m rag.cli.ingest --path ./docs --workers 8     # parallel parse/embed
 
 When ``--path`` is a directory, every non-hidden file underneath it is
 ingested and a per-status summary report is printed. The exit code is
@@ -52,6 +53,14 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=512,
         help="Approximate token budget per chunk. Defaults to 512.",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="When --path is a directory, number of concurrent prepare-phase "
+             "threads (parse/clean/chunk/embed). DocStore writes and index "
+             "updates always run one file at a time. Defaults to 1 (sequential).",
     )
     return parser
 
@@ -102,6 +111,7 @@ def main(argv: list[str] | None = None) -> int:
             source_path,
             recursive=not args.no_recursive,
             progress=True,
+            workers=args.workers,
         )
         print()
         print(report.format_summary())

@@ -17,12 +17,25 @@ class BaseKeywordIndex(ABC):
     """
 
     @abstractmethod
-    def add(self, chunks: list[Chunk]) -> None:
+    def add(self, chunks: list[Chunk], rebuild: bool = True) -> None:
         """Add chunks to the keyword index using their ``stable_text``.
 
         Args:
             chunks: Chunks to index. The ``stable_text`` field is used
                 for tokenisation and indexing.
+            rebuild: Rebuild the searchable index immediately after adding.
+                Batch callers adding many chunks in a loop should pass
+                ``False`` and call :meth:`rebuild` once at the end —
+                rebuilding after every single add is O(total chunks) per
+                call, making a naive per-document loop O(N^2) overall.
+        """
+
+    @abstractmethod
+    def rebuild(self) -> None:
+        """Rebuild the searchable index from all chunks added so far.
+
+        Only needed when chunks were added with ``rebuild=False``; a no-op
+        (but safe to call) if the index is already up to date.
         """
 
     @abstractmethod

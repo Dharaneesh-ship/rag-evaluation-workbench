@@ -106,3 +106,58 @@ def test_remove_nonexistent_chunk_does_not_raise(index):
     # Should log a warning but not raise
     index.remove("no_such_id")
     assert len(index.search("Python", top_k=5)) == 5  # all still present
+
+
+# ── Deferred rebuild (batch ingest throughput) ─────────────────────────────────
+
+
+def test_add_with_rebuild_false_not_searchable_until_rebuild(five_chunks):
+    idx = BM25LocalIndex()
+    idx.add(five_chunks, rebuild=False)
+    # Chunks are stored but the BM25 model hasn't been (re)built yet.
+    assert idx._bm25 is None
+    assert idx.search("Python programming language", top_k=5) == []
+
+    idx.rebuild()
+    assert idx._bm25 is not None
+    results = idx.search("Python programming language", top_k=5)
+    assert len(results) > 0
+
+
+def test_multiple_deferred_adds_then_single_rebuild(five_chunks):
+    idx = BM25LocalIndex()
+    for chunk in five_chunks:
+        idx.add([chunk], rebuild=False)
+    assert idx._bm25 is None  # never rebuilt mid-batch
+
+    idx.rebuild()
+    results = idx.search("Python programming language", top_k=5)
+    chunk_ids = {r.chunk_id for r in results}
+    assert "c1" in chunk_ids and "c3" in chunk_ids and "c5" in chunk_ids
+
+
+def test_add_default_rebuild_true_matches_prior_behavior(five_chunks):
+    idx = BM25LocalIndex()
+    idx.add(five_chunks)  # rebuild defaults to True
+    assert idx._bm25 is not None
+    assert len(idx.search("Python", top_k=5)) > 0
+
+
+def test_deferred_add_does_not_retokenize_per_call(monkeypatch, five_chunks):
+    # The whole point of rebuild=False: adding N batches must call the
+    # (expensive, full-corpus) rebuild zero times until rebuild() is called.
+    idx = BM25LocalIndex()
+    call_count = {"n": 0}
+    original_rebuild = idx._rebuild
+
+    def counting_rebuild():
+        call_count["n"] += 1
+        original_rebuild()
+
+    idx._rebuild = counting_rebuild
+    for chunk in five_chunks:
+        idx.add([chunk], rebuild=False)
+    assert call_count["n"] == 0
+
+    idx.rebuild()
+    assert call_count["n"] == 1
