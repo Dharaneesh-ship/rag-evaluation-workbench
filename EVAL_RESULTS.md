@@ -6,7 +6,7 @@ dataset. It answers three concrete engineering questions for this project:
 
 1. **What chunk token budget should the chunker use?**
 2. **Does hybrid (BM25 + embedding) retrieval actually beat BM25 alone, and by how much?**
-3. **What are the ingest-pipeline's throughput bottlenecks, and how much do the fixes help?**
+3. **What are the ingest-pipeline's throughput and memory bottlenecks, and how much do the fixes help?**
 
 Everything below is reproducible with one script (`scripts/asqa_eval.py`) and a
 fixed random seed. Raw per-question results for every run are saved as JSON
@@ -41,6 +41,10 @@ under `data/eval/asqa/*.json` (not tracked in git — see
   parallel), and batch ingest rebuilt the entire BM25 index from scratch after
   every document (O(N²) for a batch of N). See
   [Ingest performance optimizations](#ingest-performance-optimizations).
+- **A memory-scaling defect in batch ingest was found and fixed**: peak memory
+  during `ingest_many()` grew with the *total batch size*, not the configured
+  `max_workers` — the concurrency knob didn't actually bound memory the way
+  its name implies. See [§4](#4-bounding-ingest_many-peak-memory-to-max_workers).
 
 ---
 
@@ -222,10 +226,12 @@ in.
 ## Ingest performance optimizations
 
 Building and re-running this evaluation repeatedly (355-document corpus,
-four chunk-size configs, a hybrid-retrieval config) surfaced two independent
-ingest-side throughput bottlenecks. Both are now fixed; the two benchmarks
-below use different methodologies, noted explicitly, since only one of them
-could be measured against a live API.
+four chunk-size configs, a hybrid-retrieval config), plus a direct audit of
+upload-size, memory, and context-window handling, surfaced four ingest-side
+findings — three throughput bottlenecks and one memory-scaling defect. All
+are now fixed. The benchmarks below use different methodologies, noted
+explicitly wherever a live measurement wasn't possible or wasn't the right
+tool for the claim being made.
 
 ### 1. Vision-LLM page transcription — sequential → parallel (simulated benchmark)
 
@@ -306,6 +312,72 @@ study — the batch-mode number above (§2) isolates the index-rebuild fix
 specifically; `_prepare()`/`_commit()` concurrency compounds with it on
 multi-core machines but the combined effect was not measured here.
 
+### 4. Bounding `ingest_many()` peak memory to `max_workers`
+
+Auditing this system for memory and scaling risk (a natural follow-up
+question once ingest was made concurrent) surfaced a real defect in the
+concurrency design from §3: **peak memory during `ingest_many()` scaled with
+the total batch size, not `max_workers`** — the concurrency knob controlled
+parallelism but not memory, contrary to what its name implies.
+
+**Root cause**: `ingest_many()` submitted *all* `N` files' `_prepare()` jobs
+(parse → clean → chunk → embed) to the thread pool upfront, then drained
+completions via `as_completed()`. `ThreadPoolExecutor` bounds how many jobs
+run *concurrently* to `max_workers`, but places no limit on how many can
+*finish* and sit fully computed inside their `Future` object waiting to be
+consumed. For cheap/fast documents, worker threads race through the entire
+queued backlog far faster than a single commit-writer thread can consume
+results — so completed-but-uncommitted documents (each holding its full
+parsed block list, chunk list, and any embedding vectors) can pile up to the
+full batch size regardless of `max_workers`.
+
+An initial fix attempt — moving the `_commit()` call inside the
+`as_completed()` loop, so each result is committed as soon as it arrives —
+looked plausible but is **not actually sufficient**, for the reason above:
+completion can still race arbitrarily far ahead of consumption. A regression
+test written specifically to measure this (tracking the number of
+prepared-but-uncommitted documents at every point during a 12-file batch
+with `max_workers=3`) caught it directly:
+
+```python
+assert peak_in_flight <= max_workers   # first fix attempt: FAILED, peak_in_flight == 12
+```
+
+**Real fix**: a sliding-window submission pattern. Instead of submitting all
+`N` jobs upfront, only `max_workers` jobs are ever outstanding at once — the
+next job is submitted only after a previous one's result has been consumed
+and committed (`concurrent.futures.wait(..., return_when=FIRST_COMPLETED)`).
+This provides genuine backpressure: submission is gated on consumption, so
+memory is bounded by design, not by hoping the consumer keeps up.
+
+```python
+assert peak_in_flight <= max_workers   # sliding-window fix: PASSED
+```
+
+**Methodology note**: this is a *logical* bound proven by direct
+instrumentation (a counter incremented on prepare-start and decremented on
+commit-finish, asserted `<= max_workers` across the whole run) — not a
+live memory-profiler measurement of actual process RSS in MB. The two are
+related (bounding the count of in-flight fully-parsed documents bounds the
+memory those documents occupy) but only the former was verified here.
+
+**A related, independent gap in the same audit**: `LocalFileLoader.load()`
+called `file_path.read_bytes()` unconditionally, with no size check —
+reading an arbitrarily large file entirely into memory in one call, with no
+streaming fallback. The Studio UI's 200MB upload cap is a Streamlit-layer
+default that doesn't apply to the CLI/batch-ingest path at all, which had
+*zero* protection. Fixed with a configurable `max_file_size_bytes` guard
+(default 500MB) on `LocalFileLoader`, raising a clear `FileTooLargeError`
+before any read is attempted, wired through `IngestPipeline`'s constructor
+and reported as a normal `IngestResult(status="failed")` like any other
+ingest error.
+
+A third question from the same audit — whether the LLM-generation side has
+an unbounded context-window risk — was checked and found **already correct**:
+`LightContextPacker` enforces a `token_budget` (default 2048) with
+deduplication and truncation before any context reaches the answer-generation
+prompt. No fix was needed there.
+
 ---
 
 ## Known limitations of this study
@@ -339,6 +411,12 @@ multi-core machines but the combined effect was not measured here.
   project's shared 200k TPM OpenAI rate limit made the live comparison
   impractical. The BM25 batch-indexing speedup (3.2x), by contrast, is a
   direct, unsimulated benchmark on the real 355-document corpus.
+- **`ingest_many()` memory bound is a logical proof, not a profiled
+  measurement**: §4 verifies peak prepared-but-uncommitted document count
+  stays `<= max_workers` via direct instrumentation in a test, not via a
+  memory profiler (e.g. `tracemalloc`/`psutil`) reporting actual process RSS
+  in MB on a realistic large batch. The two should track together, but only
+  the former was measured.
 
 ---
 
@@ -365,6 +443,11 @@ python scripts/asqa_eval.py --n-samples 150 --token-budget 512 --embedding opena
 # Batch-ingest speedup benchmark (§ Ingest performance optimizations, free,
 # reuses the cached corpus from the runs above — no network or API key needed)
 python scripts/bench_batch_ingest.py
+
+# ingest_many() peak-memory bound (§4) and the file-size guard — both are
+# regression tests, not standalone scripts:
+pytest tests/test_ingest_hardening.py::TestIngestMany::test_commits_interleaved_not_batched_after_all_prepares -v
+pytest tests/test_local_file_loader.py::TestLocalFileLoaderSizeGuard -v
 ```
 
 The corpus HTML cache (`data/eval/asqa/corpus/`) is fetched once and reused
