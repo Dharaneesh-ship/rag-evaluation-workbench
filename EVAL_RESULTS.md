@@ -1,11 +1,12 @@
-# Retrieval Evaluation: ASQA Chunk-Size & Hybrid-Retrieval Study
+# Retrieval Evaluation & Ingest Performance: ASQA Study
 
 This document reports a retrieval evaluation built on [ASQA](https://huggingface.co/datasets/din0s/asqa)
 (Ambiguous Short-Answer QA, Stelmakh et al. 2022), a human-labeled long-form QA
-dataset. It answers two concrete engineering questions for this project:
+dataset. It answers three concrete engineering questions for this project:
 
 1. **What chunk token budget should the chunker use?**
 2. **Does hybrid (BM25 + embedding) retrieval actually beat BM25 alone, and by how much?**
+3. **What are the ingest-pipeline's throughput bottlenecks, and how much do the fixes help?**
 
 Everything below is reproducible with one script (`scripts/asqa_eval.py`) and a
 fixed random seed. Raw per-question results for every run are saved as JSON
@@ -35,6 +36,11 @@ under `data/eval/asqa/*.json` (not tracked in git — see
 - **A production bug was found and fixed during this study**: BM25-only ingestion
   (`embedding_provider=None`) silently never populated the keyword index. See
   [Bug found during this study](#bug-found-during-this-study).
+- **Two ingest throughput bottlenecks were found and fixed**: Vision-LLM page
+  transcription ran one page at a time (network-bound, embarrassingly
+  parallel), and batch ingest rebuilt the entire BM25 index from scratch after
+  every document (O(N²) for a batch of N). See
+  [Ingest performance optimizations](#ingest-performance-optimizations).
 
 ---
 
@@ -213,6 +219,95 @@ in.
 
 ---
 
+## Ingest performance optimizations
+
+Building and re-running this evaluation repeatedly (355-document corpus,
+four chunk-size configs, a hybrid-retrieval config) surfaced two independent
+ingest-side throughput bottlenecks. Both are now fixed; the two benchmarks
+below use different methodologies, noted explicitly, since only one of them
+could be measured against a live API.
+
+### 1. Vision-LLM page transcription — sequential → parallel (simulated benchmark)
+
+Pages escalated to the Vision-LLM tier (`PdfVisionParser`'s full-document
+fallback, and `PdfHybridParser`'s per-page escalation for complex PDFs — see
+the ingest-hardening work earlier in this project) were transcribed one HTTP
+round-trip at a time. Each page's Vision call is independent and
+network-bound, not CPU-bound, so this is embarrassingly parallel. Both
+parsers now transcribe pages concurrently via a shared `ThreadPoolExecutor`
+primitive (`PdfVisionParser.parse_pages_parallel`, default 8 workers,
+configurable via `vision.max_workers` in `parser_candidates.yaml`).
+
+**Methodology caveat**: this project's OpenAI account is subject to a shared
+200k TPM rate limit, which made a live back-to-back sequential-vs-parallel
+benchmark impractical (a full sequential run would consume rate-limit budget
+needed for other testing). Instead, one real API call's latency was measured
+(**2.06s/page**, `gpt-4o-mini`, full-page image transcription) and used to
+simulate 16 pages under both worker counts:
+
+| Workers | Time (16 pages, simulated at measured 2.06s/page latency) |
+|---:|---:|
+| 1 (sequential) | 33.0s |
+| 8 (parallel) | 4.1s |
+| **Speedup** | **8.0x** |
+
+This is the expected ceiling for this workload shape (independent,
+latency-dominated HTTP calls, no shared CPU/GPU resource to contend for) —
+real-world speedup should track close to this since the bottleneck is network
+wait, not local compute, but has not been verified against live back-to-back
+API calls due to the rate-limit constraint above.
+
+### 2. Batch ingest — eliminating O(N²) BM25 index rebuild (real benchmark)
+
+`BM25LocalIndex.add()` retokenized and rebuilt the entire `rank_bm25.BM25Okapi`
+model from scratch on every call, and `IngestPipeline` called `add()` once per
+document. Ingesting a batch of *N* documents therefore did *O(N²)* work: the
+1st document's chunks get tokenized once, but by the *N*th document, every
+prior document's chunks are retokenized again on top of the new one.
+
+**Fix**: `add()` gained a `rebuild: bool = True` parameter, and
+`IngestPipeline.begin_batch()` / `end_batch()` context toggles a batch mode
+that defers rebuilding (`add(chunks, rebuild=False)`) until the whole batch is
+committed, then rebuilds **once**. `BatchIngestRunner` and the new
+`ingest_many()` (see below) use this automatically.
+
+This was benchmarked directly — no simulation — by re-ingesting the same
+355-document, 6,477-chunk ASQA corpus used throughout this study, into two
+fresh isolated indexes, with and without batch mode:
+
+| Mode | Time (355 docs, 6,477 chunks) |
+|---|---:|
+| Before (`add()` per document, no batch mode) | 239.2s |
+| After (`begin_batch()` / `end_batch()`) | 73.7s |
+| **Speedup** | **3.2x** (69% time reduction) |
+
+**Reading**: 3.2x is lower than the O(N²)→O(N) complexity change alone would
+suggest, because index rebuild is only *part* of total ingest time — parsing,
+cleaning, chunking, and DocStore writes are fixed per-document costs that
+batch mode doesn't touch. The 165.5s saved is specifically the retokenization
+work eliminated by rebuilding once instead of 355 times; this fraction grows
+with corpus size, so the speedup would be larger on a bigger batch and smaller
+on a tiny one.
+
+### 3. File-level ingest concurrency
+
+Alongside the O(N²) fix, `IngestPipeline._run()` was split into `_prepare()`
+(parse/clean/chunk — read-only, side-effect-free, safe to run concurrently
+across files) and `_commit()` (DocStore writes + index updates — must stay
+serial, since SQLite has a single writer and the in-memory BM25/FAISS index
+objects aren't thread-safe to mutate concurrently). The new
+`IngestPipeline.ingest_many(paths, max_workers=N)` runs `_prepare()` for up to
+*N* files at once in a thread pool, then commits sequentially in original
+file order — overlapping CPU/IO-bound parsing (and any per-file Vision API
+calls) across files instead of processing one file fully before starting the
+next. Exposed via `rag/cli/ingest.py --workers` and used automatically by
+`BatchIngestRunner` when `workers > 1`. Not separately benchmarked in this
+study — the batch-mode number above (§2) isolates the index-rebuild fix
+specifically; `_prepare()`/`_commit()` concurrency compounds with it on
+multi-core machines but the combined effect was not measured here.
+
+---
+
 ## Known limitations of this study
 
 - **Sample size**: 150 of 948 dev examples (503 of the resulting sub-questions).
@@ -237,6 +332,13 @@ in.
   (128/256/512/768) used BM25-only; hybrid retrieval was only tested at the
   already-selected 512-token budget. It's possible the hybrid recall curve
   peaks at a different chunk size — not verified.
+- **Vision parallelization speedup is simulated, not live-measured**: the
+  8.0x number (§ [Ingest performance optimizations](#ingest-performance-optimizations))
+  is derived from one real per-page API latency measurement replayed under
+  simulated concurrency, not a live sequential-vs-parallel run — this
+  project's shared 200k TPM OpenAI rate limit made the live comparison
+  impractical. The BM25 batch-indexing speedup (3.2x), by contrast, is a
+  direct, unsimulated benchmark on the real 355-document corpus.
 
 ---
 
@@ -259,6 +361,10 @@ python scripts/asqa_eval.py --n-samples 150 --token-budget 768 \
 # Hybrid retrieval at the selected chunk size (requires OPENAI_API_KEY, ~$0.10-0.20)
 python scripts/asqa_eval.py --n-samples 150 --token-budget 512 --embedding openai \
   --data-dir data/eval/asqa --output data/eval/asqa/pilot_tb512_openai_results.json
+
+# Batch-ingest speedup benchmark (§ Ingest performance optimizations, free,
+# reuses the cached corpus from the runs above — no network or API key needed)
+python scripts/bench_batch_ingest.py
 ```
 
 The corpus HTML cache (`data/eval/asqa/corpus/`) is fetched once and reused
