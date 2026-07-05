@@ -439,8 +439,44 @@ class TestKeywordIndexIndependentOfEmbedding:
 
 
 # ---------------------------------------------------------------------------
-# Batch mode: deferred index rebuild/persistence (O(N^2) -> O(N) fix)
+# Persistence contract: IngestPipeline's saved indexes must be the same
+# files IndexManager (CLI query, MCP server, Studio query/eval pages) reads.
 # ---------------------------------------------------------------------------
+
+
+class TestIndexPersistenceMatchesIndexManager:
+    def test_ingested_content_is_visible_via_index_manager_reload(self, tmp_path):
+        # Regression guard: IngestPipeline._persist_indexes() previously
+        # saved to `<index_dir>/bm25.index/bm25.pkl` (a per-type subpath),
+        # while IndexManager always reads `<index_dir>/bm25.pkl` directly —
+        # so anything ingested via IngestPipeline(index_dir=...) (e.g. the
+        # ASQA eval scripts) was silently invisible to any later
+        # IndexManager-based reload, with no error anywhere.
+        from rag.infra.indexes.index_manager import IndexManager
+        from rag.infra.indexes.bm25_local import BM25LocalIndex
+        from rag.infra.stores.docstore_sqlite import SQLiteDocStore
+        from rag.infra.stores.tracestore_sqlite import SQLiteTraceStore
+        from rag.pipelines.ingest_pipeline import IngestPipeline
+
+        index_dir = tmp_path / "indexes"
+        db = tmp_path / "test.db"
+        pipeline = IngestPipeline(
+            SQLiteDocStore(db),
+            SQLiteTraceStore(db),
+            keyword_index=BM25LocalIndex(),
+            index_dir=index_dir,
+        )
+        f = tmp_path / "doc.md"
+        f.write_text("# Title\n\nContent about cats and dogs with enough words.")
+        result = pipeline.ingest(f)
+        assert result.status == "ok"
+
+        # A completely independent IndexManager, reloading from disk only —
+        # this is exactly what CLI query / MCP server / Studio's query page
+        # do; it must see the content IngestPipeline just persisted.
+        mgr = IndexManager(index_dir=index_dir)
+        assert len(mgr.bm25._chunks) == result.chunk_count > 0
+        assert mgr.bm25.search("cats and dogs", top_k=5)
 
 
 class TestBatchMode:
@@ -528,7 +564,10 @@ class TestBatchMode:
         assert save_calls["n"] == 0  # no disk writes mid-batch
         pipeline.end_batch()
         assert save_calls["n"] == 1  # exactly one disk write at the end
-        assert (index_dir / "bm25.index").exists()
+        # bm25.pkl directly under index_dir — NOT a "bm25.index" subdirectory
+        # (that nested-path bug made IndexManager-loaded content invisible).
+        assert (index_dir / "bm25.pkl").exists()
+        assert not (index_dir / "bm25.index").exists()
 
     def test_single_document_ingest_unaffected_by_batch_mode(self, tmp_path):
         # Outside begin_batch/end_batch, behavior must be identical to before:

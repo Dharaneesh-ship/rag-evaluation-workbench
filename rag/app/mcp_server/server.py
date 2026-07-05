@@ -66,7 +66,7 @@ def rag_ingest(input: IngestToolInput) -> IngestToolOutput:
     """
     logger.info("rag.ingest called: source_path=%s", input.source_path)
     try:
-        pipeline = build_ingest_pipeline(
+        pipeline, index_mgr = build_ingest_pipeline(
             db_path=input.db_path,
             index_dir=input.index_dir,
             token_budget=input.token_budget,
@@ -76,11 +76,10 @@ def rag_ingest(input: IngestToolInput) -> IngestToolOutput:
         )
         result = pipeline.ingest(input.source_path)
 
-        # Persist indexes if they were updated
-        if input.embedding_provider == "openai":
-            from rag.infra.indexes.index_manager import IndexManager
-            mgr = IndexManager(index_dir=input.index_dir)
-            mgr.save()
+        # Persist the same IndexManager instance the ingest actually
+        # mutated — constructing a fresh IndexManager here would reload a
+        # stale, pre-ingest snapshot from disk instead.
+        index_mgr.save()
 
         return IngestToolOutput(
             doc_id=result.doc_id,
@@ -330,7 +329,7 @@ def rag_sync_source(input: SyncSourceToolInput) -> SyncSourceToolOutput:
 
         connector = _load_connector(input.connector)
 
-        ingest_pipeline = build_ingest_pipeline(
+        ingest_pipeline, index_mgr = build_ingest_pipeline(
             db_path=input.db_path,
             index_dir=input.index_dir,
             token_budget=input.token_budget,
@@ -349,6 +348,8 @@ def rag_sync_source(input: SyncSourceToolInput) -> SyncSourceToolOutput:
         )
 
         result = pipeline.run(since_cursor=input.since_cursor)
+        # Persist the same IndexManager instance the sync actually mutated.
+        index_mgr.save()
 
         return SyncSourceToolOutput(
             connector=input.connector,

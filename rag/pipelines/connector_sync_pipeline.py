@@ -20,13 +20,15 @@ Usage::
     from rag.pipelines.connector_sync_pipeline import ConnectorSyncPipeline
 
     connector = SlackConnector(token="xoxb-...", channel_ids=["C123"])
+    ingest_pipeline, index_mgr = build_ingest_pipeline(...)
     pipeline = ConnectorSyncPipeline(
         connector=connector,
-        ingest_pipeline=build_ingest_pipeline(...),
+        ingest_pipeline=ingest_pipeline,
         doc_store=SQLiteDocStore("data/rag.db"),
         trace_store=SQLiteTraceStore("data/rag.db"),
     )
     result = pipeline.run()
+    index_mgr.save()  # persist the same IndexManager instance that was mutated
     print(result.fetched, result.ingested, result.skipped, result.failed)
 """
 

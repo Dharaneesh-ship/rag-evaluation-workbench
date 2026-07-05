@@ -177,7 +177,7 @@ def _render_connector_tab(connector: str) -> None:
                 Path(db_path).parent.mkdir(parents=True, exist_ok=True)
                 Path(index_dir).mkdir(parents=True, exist_ok=True)
 
-                ingest_pipeline = build_ingest_pipeline(
+                ingest_pipeline, index_mgr = build_ingest_pipeline(
                     db_path=db_path,
                     index_dir=index_dir,
                     embedding_provider=emb_provider if emb_provider != "none" else None,
@@ -195,6 +195,10 @@ def _render_connector_tab(connector: str) -> None:
 
                 since = cursor_override.strip() if cursor_override.strip() else None
                 result = pipeline.run(since_cursor=since)
+                # Persist the same IndexManager instance the sync actually
+                # mutated — constructing a fresh IndexManager here would
+                # reload a stale, pre-sync snapshot instead.
+                index_mgr.save()
 
                 # Display results
                 st.success("✅ Sync complete")

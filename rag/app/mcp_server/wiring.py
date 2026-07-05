@@ -17,7 +17,7 @@ def build_ingest_pipeline(
     embedding_model: str = "text-embedding-3-small",
     vector_dimension: int = 1536,
 ):
-    """Instantiate and return a configured IngestPipeline.
+    """Instantiate a configured IngestPipeline plus the IndexManager it mutates.
 
     Args:
         db_path: SQLite database path.
@@ -28,8 +28,14 @@ def build_ingest_pipeline(
         vector_dimension: Expected vector dimensionality.
 
     Returns:
-        Configured ``IngestPipeline`` instance.
+        ``(pipeline, mgr)`` — the configured ``IngestPipeline`` and the
+        ``IndexManager`` whose ``bm25``/``faiss`` objects it was wired with.
+        Callers must call ``mgr.save()`` on *this* object after ingesting —
+        constructing a fresh ``IndexManager`` at save time reloads a stale,
+        pre-ingest snapshot from disk instead of the one this pipeline
+        actually mutated.
     """
+    from rag.infra.indexes.index_manager import IndexManager
     from rag.infra.stores.docstore_sqlite import SQLiteDocStore
     from rag.infra.stores.tracestore_sqlite import SQLiteTraceStore
     from rag.pipelines.ingest_pipeline import IngestPipeline
@@ -40,30 +46,31 @@ def build_ingest_pipeline(
     doc_store = SQLiteDocStore(db_path)
     trace_store = SQLiteTraceStore(db_path)
 
+    # Keyword (BM25) indexing needs no vectors, so the IndexManager is built
+    # regardless of embedding_provider — a BM25-only ingest (no embedding
+    # provider configured) must still get a keyword index wired in.
+    mgr = IndexManager(index_dir=index_dir)
+
     embed_provider = None
     vec_index = None
-    kw_index = None
-
     if embedding_provider == "openai":
         from rag.infra.embedding.openai_embedding import OpenAIEmbeddingProvider
-        from rag.infra.indexes.index_manager import IndexManager
 
         embed_provider = OpenAIEmbeddingProvider(
             model=embedding_model,
-            dimensions=vector_dimension,
+            dim=vector_dimension,
         )
-        mgr = IndexManager(index_dir=index_dir)
         vec_index = mgr.faiss
-        kw_index = mgr.bm25
 
-    return IngestPipeline(
+    pipeline = IngestPipeline(
         doc_store=doc_store,
         trace_store=trace_store,
         token_budget=token_budget,
         embedding_provider=embed_provider,
         vector_index=vec_index,
-        keyword_index=kw_index,
+        keyword_index=mgr.bm25,
     )
+    return pipeline, mgr
 
 
 def build_query_pipeline(

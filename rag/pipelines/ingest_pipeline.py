@@ -432,13 +432,23 @@ class IngestPipeline:
         self._persist_indexes()
 
     def _persist_indexes(self) -> None:
-        """Save the keyword/vector indexes to ``self._index_dir``, if configured."""
+        """Save the keyword/vector indexes to ``self._index_dir``, if configured.
+
+        ``BM25LocalIndex.save()``/``FaissLocalIndex.save()`` both treat their
+        ``path`` argument as a *directory* and write their own fixed filename
+        inside it (``bm25.pkl``, ``faiss.index`` respectively) — this is the
+        same convention ``IndexManager`` uses to load them back. Passing a
+        per-type subpath here (e.g. ``index_dir / "bm25.index"``) would nest
+        the real file one directory too deep, silently producing an index
+        that ``IndexManager`` (and anything built on it — CLI query, the MCP
+        server, Studio's query/eval pages) can never find.
+        """
         if self._index_dir and (self._keyword_index is not None or self._vector_index is not None):
             self._index_dir.mkdir(parents=True, exist_ok=True)
             if self._keyword_index is not None:
-                self._keyword_index.save(str(self._index_dir / "bm25.index"))
+                self._keyword_index.save(str(self._index_dir))
             if self._vector_index is not None:
-                self._vector_index.save(str(self._index_dir / "faiss.index"))
+                self._vector_index.save(str(self._index_dir))
             logger.debug("Saved updated indexes to '%s'", self._index_dir)
 
     def _load_guardrail_config(

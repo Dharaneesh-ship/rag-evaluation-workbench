@@ -68,7 +68,7 @@ def test_rag_ingest_returns_ingest_tool_output():
     with patch("rag.app.mcp_server.server.build_ingest_pipeline") as mock_build:
         mock_pipeline = MagicMock()
         mock_pipeline.ingest.return_value = _make_ingest_result()
-        mock_build.return_value = mock_pipeline
+        mock_build.return_value = (mock_pipeline, MagicMock())
         result = rag_ingest(inp)
     assert isinstance(result, IngestToolOutput)
 
@@ -76,7 +76,9 @@ def test_rag_ingest_returns_ingest_tool_output():
 def test_rag_ingest_populates_doc_id():
     inp = IngestToolInput(source_path="/tmp/doc.txt")
     with patch("rag.app.mcp_server.server.build_ingest_pipeline") as mock_build:
-        mock_build.return_value.ingest.return_value = _make_ingest_result(doc_id="doc-xyz")
+        mock_pipeline = MagicMock()
+        mock_pipeline.ingest.return_value = _make_ingest_result(doc_id="doc-xyz")
+        mock_build.return_value = (mock_pipeline, MagicMock())
         result = rag_ingest(inp)
     assert result.doc_id == "doc-xyz"
 
@@ -84,9 +86,11 @@ def test_rag_ingest_populates_doc_id():
 def test_rag_ingest_populates_counts():
     inp = IngestToolInput(source_path="/tmp/doc.txt")
     with patch("rag.app.mcp_server.server.build_ingest_pipeline") as mock_build:
-        mock_build.return_value.ingest.return_value = _make_ingest_result(
+        mock_pipeline = MagicMock()
+        mock_pipeline.ingest.return_value = _make_ingest_result(
             block_count=10, chunk_count=4
         )
+        mock_build.return_value = (mock_pipeline, MagicMock())
         result = rag_ingest(inp)
     assert result.block_count == 10
     assert result.chunk_count == 4
@@ -105,7 +109,9 @@ def test_rag_ingest_error_returns_output_with_error():
 def test_rag_ingest_skipped_flag_forwarded():
     inp = IngestToolInput(source_path="/tmp/doc.txt")
     with patch("rag.app.mcp_server.server.build_ingest_pipeline") as mock_build:
-        mock_build.return_value.ingest.return_value = _make_ingest_result(skipped=True)
+        mock_pipeline = MagicMock()
+        mock_pipeline.ingest.return_value = _make_ingest_result(skipped=True)
+        mock_build.return_value = (mock_pipeline, MagicMock())
         result = rag_ingest(inp)
     assert result.skipped is True
 
