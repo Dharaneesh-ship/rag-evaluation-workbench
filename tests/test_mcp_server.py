@@ -63,8 +63,14 @@ def _make_query_result(**kwargs):
 # ---------------------------------------------------------------------------
 
 
-def test_rag_ingest_returns_ingest_tool_output():
-    inp = IngestToolInput(source_path="/tmp/doc.txt")
+# rag_ingest now constructs a real IndexManager (only build_ingest_pipeline
+# is mocked below) and enters exclusive_session() against input.index_dir —
+# every test here must point that at an isolated tmp_path, never the
+# schema's "data/indexes" default, or it would touch real project data.
+
+
+def test_rag_ingest_returns_ingest_tool_output(tmp_path):
+    inp = IngestToolInput(source_path="/tmp/doc.txt", index_dir=str(tmp_path / "indexes"))
     with patch("rag.app.mcp_server.server.build_ingest_pipeline") as mock_build:
         mock_pipeline = MagicMock()
         mock_pipeline.ingest.return_value = _make_ingest_result()
@@ -73,8 +79,8 @@ def test_rag_ingest_returns_ingest_tool_output():
     assert isinstance(result, IngestToolOutput)
 
 
-def test_rag_ingest_populates_doc_id():
-    inp = IngestToolInput(source_path="/tmp/doc.txt")
+def test_rag_ingest_populates_doc_id(tmp_path):
+    inp = IngestToolInput(source_path="/tmp/doc.txt", index_dir=str(tmp_path / "indexes"))
     with patch("rag.app.mcp_server.server.build_ingest_pipeline") as mock_build:
         mock_pipeline = MagicMock()
         mock_pipeline.ingest.return_value = _make_ingest_result(doc_id="doc-xyz")
@@ -83,8 +89,8 @@ def test_rag_ingest_populates_doc_id():
     assert result.doc_id == "doc-xyz"
 
 
-def test_rag_ingest_populates_counts():
-    inp = IngestToolInput(source_path="/tmp/doc.txt")
+def test_rag_ingest_populates_counts(tmp_path):
+    inp = IngestToolInput(source_path="/tmp/doc.txt", index_dir=str(tmp_path / "indexes"))
     with patch("rag.app.mcp_server.server.build_ingest_pipeline") as mock_build:
         mock_pipeline = MagicMock()
         mock_pipeline.ingest.return_value = _make_ingest_result(
@@ -96,8 +102,8 @@ def test_rag_ingest_populates_counts():
     assert result.chunk_count == 4
 
 
-def test_rag_ingest_error_returns_output_with_error():
-    inp = IngestToolInput(source_path="/tmp/doc.txt")
+def test_rag_ingest_error_returns_output_with_error(tmp_path):
+    inp = IngestToolInput(source_path="/tmp/doc.txt", index_dir=str(tmp_path / "indexes"))
     with patch("rag.app.mcp_server.server.build_ingest_pipeline") as mock_build:
         mock_build.side_effect = RuntimeError("DB connection failed")
         result = rag_ingest(inp)
@@ -106,8 +112,8 @@ def test_rag_ingest_error_returns_output_with_error():
     assert result.doc_id == ""
 
 
-def test_rag_ingest_skipped_flag_forwarded():
-    inp = IngestToolInput(source_path="/tmp/doc.txt")
+def test_rag_ingest_skipped_flag_forwarded(tmp_path):
+    inp = IngestToolInput(source_path="/tmp/doc.txt", index_dir=str(tmp_path / "indexes"))
     with patch("rag.app.mcp_server.server.build_ingest_pipeline") as mock_build:
         mock_pipeline = MagicMock()
         mock_pipeline.ingest.return_value = _make_ingest_result(skipped=True)

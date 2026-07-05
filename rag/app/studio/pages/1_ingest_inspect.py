@@ -120,8 +120,19 @@ with st.sidebar:
 
 def _build_pipeline(db_path, index_dir, token_budget, embedding_provider,
                     embedding_model, vector_dimension, index_type,
-                    vision_model="gpt-4o-mini"):
-    """Instantiate stores, indexes, and IngestPipeline. Returns (pipeline, vec_index, kw_index)."""
+                    index_mgr, vision_model="gpt-4o-mini"):
+    """Instantiate stores and IngestPipeline against a caller-provided IndexManager.
+
+    Args:
+        index_mgr: An ``IndexManager`` the caller has already entered via
+            ``exclusive_session()`` — this function wires the pipeline to
+            ``index_mgr.bm25``/``index_mgr.faiss`` directly rather than
+            constructing its own, so the pipeline mutates (and the session
+            later saves) the same, freshly-reloaded objects.
+
+    Returns:
+        ``(pipeline, vec_index, kw_index)``.
+    """
     from rag.infra.stores.docstore_sqlite import SQLiteDocStore
     from rag.infra.stores.tracestore_sqlite import SQLiteTraceStore
     from rag.pipelines.ingest_pipeline import IngestPipeline
@@ -134,16 +145,16 @@ def _build_pipeline(db_path, index_dir, token_budget, embedding_provider,
 
     embed_provider = None
     vec_index = None
-    kw_index = None
+    # Keyword (BM25) indexing needs no vectors, so it must not be gated on
+    # embedding_provider — BM25-only mode (embedding_provider == "none") is a
+    # supported configuration and must still populate the keyword index.
+    kw_index = index_mgr.bm25
 
     if embedding_provider in ("openai", "multilingual"):
-        from rag.infra.indexes.faiss_local import FaissLocalIndex
-        from rag.infra.indexes.index_manager import IndexManager
-
         if embedding_provider == "openai":
             from rag.infra.embedding.openai_embedding import OpenAIEmbeddingProvider
             embed_provider = OpenAIEmbeddingProvider(
-                model=embedding_model, dimensions=int(vector_dimension)
+                model=embedding_model, dim=int(vector_dimension)
             )
         else:
             from rag.infra.embedding.multilingual_embedding import MultilingualEmbeddingProvider
@@ -151,24 +162,16 @@ def _build_pipeline(db_path, index_dir, token_budget, embedding_provider,
                 model=embedding_model, dim=int(vector_dimension)
             )
 
-        faiss_path = Path(index_dir) / "faiss.index"
-        if faiss_path.exists():
-            try:
-                existing = FaissLocalIndex()
-                existing.load(index_dir)
-                if existing.dimension != int(vector_dimension):
-                    raise ValueError(
-                        f"Dimension mismatch: existing index={existing.dimension}, "
-                        f"configured={int(vector_dimension)}"
-                    )
-            except ValueError:
-                raise
-            except Exception:
-                pass
-
-        mgr = IndexManager(index_dir=index_dir)
-        vec_index = mgr.faiss
-        kw_index = mgr.bm25
+        # index_mgr.faiss already reflects the current on-disk state (loaded
+        # at construction, or freshly reloaded if entered via
+        # exclusive_session()) — dimension() is 0 for an empty/new index.
+        existing_dim = index_mgr.faiss.dimension
+        if existing_dim and existing_dim != int(vector_dimension):
+            raise ValueError(
+                f"Dimension mismatch: existing index={existing_dim}, "
+                f"configured={int(vector_dimension)}"
+            )
+        vec_index = index_mgr.faiss
 
     pipeline = IngestPipeline(
         doc_store=doc_store,
@@ -242,32 +245,37 @@ if run_btn and uploaded_files:
         "vision_model": vision_model,
     }
     try:
-        pipeline, vec_index, kw_index = _build_pipeline(
-            db_path, index_dir, token_budget, embedding_provider,
-            embedding_model, vector_dimension, index_type,
-            vision_model=vision_model,
-        )
-        results, original_names, doc_ids = [], [], []
-        progress = st.progress(0, text="Starting…")
-        for i, uf in enumerate(uploaded_files):
-            progress.progress(
-                i / len(uploaded_files),
-                text=f"Ingesting **{uf.name}** ({i + 1}/{len(uploaded_files)})…",
+        from rag.infra.indexes.index_manager import IndexManager
+
+        index_mgr = IndexManager(index_dir=index_dir)
+        # Locks the whole load-mutate-save cycle so a concurrent ingest/sync
+        # against the same index_dir can't silently overwrite this one's
+        # additions — reload happens fresh inside the lock, save happens
+        # automatically on clean exit. Pipeline is built *inside* the
+        # session so it references the freshly-reloaded index objects.
+        with index_mgr.exclusive_session():
+            pipeline, vec_index, kw_index = _build_pipeline(
+                db_path, index_dir, token_budget, embedding_provider,
+                embedding_model, vector_dimension, index_type,
+                index_mgr=index_mgr, vision_model=vision_model,
             )
-            suffix = Path(uf.name).suffix
-            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-                tmp.write(uf.getbuffer())
-                tmp_path = tmp.name
-            result = pipeline.ingest(tmp_path, canonical_name=uf.name)
-            results.append(result)
-            original_names.append(uf.name)
-            if result.doc_id:
-                doc_ids.append(result.doc_id)
-        progress.progress(1.0, text="Done!")
-        if vec_index is not None:
-            vec_index.save(index_dir)
-        if kw_index is not None:
-            kw_index.save(index_dir)
+            results, original_names, doc_ids = [], [], []
+            progress = st.progress(0, text="Starting…")
+            for i, uf in enumerate(uploaded_files):
+                progress.progress(
+                    i / len(uploaded_files),
+                    text=f"Ingesting **{uf.name}** ({i + 1}/{len(uploaded_files)})…",
+                )
+                suffix = Path(uf.name).suffix
+                with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                    tmp.write(uf.getbuffer())
+                    tmp_path = tmp.name
+                result = pipeline.ingest(tmp_path, canonical_name=uf.name)
+                results.append(result)
+                original_names.append(uf.name)
+                if result.doc_id:
+                    doc_ids.append(result.doc_id)
+            progress.progress(1.0, text="Done!")
         st.session_state.ingest_result = list(zip(original_names, results))
         st.session_state.last_doc_ids = doc_ids
     except Exception as exc:
@@ -297,33 +305,33 @@ if run_url_btn and url_input.strip():
     }
     try:
         from rag.infra.connectors.web_connector import WebConnector
-        pipeline, vec_index, kw_index = _build_pipeline(
-            db_path, index_dir, token_budget, embedding_provider,
-            embedding_model, vector_dimension, index_type,
-            vision_model=vision_model,
-        )
-        progress = st.progress(0, text=f"Fetching {len(urls)} URL(s)…")
-        artifacts = WebConnector().fetch(urls)
-        if not artifacts:
-            st.session_state.ingest_error = "❌ No content could be fetched from the provided URLs."
-            st.rerun()
-        results, original_names, doc_ids = [], [], []
-        for i, artifact in enumerate(artifacts):
-            progress.progress(
-                i / len(artifacts),
-                text=f"Ingesting **{artifact.canonical_name}** ({i + 1}/{len(artifacts)})…",
+        from rag.infra.indexes.index_manager import IndexManager
+
+        index_mgr = IndexManager(index_dir=index_dir)
+        with index_mgr.exclusive_session():
+            pipeline, vec_index, kw_index = _build_pipeline(
+                db_path, index_dir, token_budget, embedding_provider,
+                embedding_model, vector_dimension, index_type,
+                index_mgr=index_mgr, vision_model=vision_model,
             )
-            result = pipeline.ingest(artifact.tmp_path, canonical_name=artifact.canonical_name)
-            results.append(result)
-            original_names.append(artifact.canonical_name)
-            if result.doc_id:
-                doc_ids.append(result.doc_id)
-            artifact.cleanup()
-        progress.progress(1.0, text="Done!")
-        if vec_index is not None:
-            vec_index.save(index_dir)
-        if kw_index is not None:
-            kw_index.save(index_dir)
+            progress = st.progress(0, text=f"Fetching {len(urls)} URL(s)…")
+            artifacts = WebConnector().fetch(urls)
+            if not artifacts:
+                st.session_state.ingest_error = "❌ No content could be fetched from the provided URLs."
+                st.rerun()
+            results, original_names, doc_ids = [], [], []
+            for i, artifact in enumerate(artifacts):
+                progress.progress(
+                    i / len(artifacts),
+                    text=f"Ingesting **{artifact.canonical_name}** ({i + 1}/{len(artifacts)})…",
+                )
+                result = pipeline.ingest(artifact.tmp_path, canonical_name=artifact.canonical_name)
+                results.append(result)
+                original_names.append(artifact.canonical_name)
+                if result.doc_id:
+                    doc_ids.append(result.doc_id)
+                artifact.cleanup()
+            progress.progress(1.0, text="Done!")
         st.session_state.ingest_result = list(zip(original_names, results))
         st.session_state.last_doc_ids = doc_ids
     except Exception as exc:

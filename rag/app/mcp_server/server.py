@@ -66,20 +66,23 @@ def rag_ingest(input: IngestToolInput) -> IngestToolOutput:
     """
     logger.info("rag.ingest called: source_path=%s", input.source_path)
     try:
-        pipeline, index_mgr = build_ingest_pipeline(
-            db_path=input.db_path,
-            index_dir=input.index_dir,
-            token_budget=input.token_budget,
-            embedding_provider=input.embedding_provider,
-            embedding_model=input.embedding_model,
-            vector_dimension=input.vector_dimension,
-        )
-        result = pipeline.ingest(input.source_path)
+        from rag.infra.indexes.index_manager import IndexManager
 
-        # Persist the same IndexManager instance the ingest actually
-        # mutated — constructing a fresh IndexManager here would reload a
-        # stale, pre-ingest snapshot from disk instead.
-        index_mgr.save()
+        index_mgr = IndexManager(index_dir=input.index_dir)
+        # Locks the load-mutate-save cycle against a concurrent ingest/sync
+        # on the same index_dir; reload happens fresh inside the lock, save
+        # happens automatically on clean exit.
+        with index_mgr.exclusive_session():
+            pipeline, _ = build_ingest_pipeline(
+                db_path=input.db_path,
+                index_dir=input.index_dir,
+                token_budget=input.token_budget,
+                embedding_provider=input.embedding_provider,
+                embedding_model=input.embedding_model,
+                vector_dimension=input.vector_dimension,
+                index_mgr=index_mgr,
+            )
+            result = pipeline.ingest(input.source_path)
 
         return IngestToolOutput(
             doc_id=result.doc_id,
@@ -327,29 +330,30 @@ def rag_sync_source(input: SyncSourceToolInput) -> SyncSourceToolOutput:
         from rag.infra.stores.tracestore_sqlite import SQLiteTraceStore
         from rag.pipelines.connector_sync_pipeline import ConnectorSyncPipeline
 
-        connector = _load_connector(input.connector)
+        from rag.infra.indexes.index_manager import IndexManager
 
-        ingest_pipeline, index_mgr = build_ingest_pipeline(
-            db_path=input.db_path,
-            index_dir=input.index_dir,
-            token_budget=input.token_budget,
-            embedding_provider=input.embedding_provider,
-            embedding_model=input.embedding_model,
-            vector_dimension=input.vector_dimension,
-        )
+        connector = _load_connector(input.connector)
         doc_store = SQLiteDocStore(input.db_path)
         trace_store = SQLiteTraceStore(input.db_path)
 
-        pipeline = ConnectorSyncPipeline(
-            connector=connector,
-            ingest_pipeline=ingest_pipeline,
-            doc_store=doc_store,
-            trace_store=trace_store,
-        )
-
-        result = pipeline.run(since_cursor=input.since_cursor)
-        # Persist the same IndexManager instance the sync actually mutated.
-        index_mgr.save()
+        index_mgr = IndexManager(index_dir=input.index_dir)
+        with index_mgr.exclusive_session():
+            ingest_pipeline, _ = build_ingest_pipeline(
+                db_path=input.db_path,
+                index_dir=input.index_dir,
+                token_budget=input.token_budget,
+                embedding_provider=input.embedding_provider,
+                embedding_model=input.embedding_model,
+                vector_dimension=input.vector_dimension,
+                index_mgr=index_mgr,
+            )
+            pipeline = ConnectorSyncPipeline(
+                connector=connector,
+                ingest_pipeline=ingest_pipeline,
+                doc_store=doc_store,
+                trace_store=trace_store,
+            )
+            result = pipeline.run(since_cursor=input.since_cursor)
 
         return SyncSourceToolOutput(
             connector=input.connector,

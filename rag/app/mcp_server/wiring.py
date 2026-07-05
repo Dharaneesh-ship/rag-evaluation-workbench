@@ -16,6 +16,7 @@ def build_ingest_pipeline(
     embedding_provider: Optional[str] = None,
     embedding_model: str = "text-embedding-3-small",
     vector_dimension: int = 1536,
+    index_mgr=None,
 ):
     """Instantiate a configured IngestPipeline plus the IndexManager it mutates.
 
@@ -26,14 +27,21 @@ def build_ingest_pipeline(
         embedding_provider: Provider key (``"openai"``) or None to skip embedding.
         embedding_model: Model identifier for the embedding provider.
         vector_dimension: Expected vector dimensionality.
+        index_mgr: Optional pre-built ``IndexManager``. Pass one you've
+            already entered via ``exclusive_session()`` so the pipeline is
+            wired to the freshly-reloaded ``bm25``/``faiss`` objects rather
+            than a pre-lock snapshot — required for concurrent-write
+            safety. If None, a fresh (unlocked) ``IndexManager`` is
+            constructed here, matching the previous behavior.
 
     Returns:
         ``(pipeline, mgr)`` — the configured ``IngestPipeline`` and the
-        ``IndexManager`` whose ``bm25``/``faiss`` objects it was wired with.
-        Callers must call ``mgr.save()`` on *this* object after ingesting —
-        constructing a fresh ``IndexManager`` at save time reloads a stale,
-        pre-ingest snapshot from disk instead of the one this pipeline
-        actually mutated.
+        ``IndexManager`` whose ``bm25``/``faiss`` objects it was wired with
+        (``index_mgr`` itself, if provided). Callers must call ``mgr.save()``
+        (or exit the ``exclusive_session()`` that owns it) — constructing a
+        *different* fresh ``IndexManager`` to save would reload a stale,
+        pre-ingest snapshot instead of the one this pipeline actually
+        mutated.
     """
     from rag.infra.indexes.index_manager import IndexManager
     from rag.infra.stores.docstore_sqlite import SQLiteDocStore
@@ -49,7 +57,7 @@ def build_ingest_pipeline(
     # Keyword (BM25) indexing needs no vectors, so the IndexManager is built
     # regardless of embedding_provider — a BM25-only ingest (no embedding
     # provider configured) must still get a keyword index wired in.
-    mgr = IndexManager(index_dir=index_dir)
+    mgr = index_mgr if index_mgr is not None else IndexManager(index_dir=index_dir)
 
     embed_provider = None
     vec_index = None
@@ -120,7 +128,7 @@ def build_query_pipeline(
         from rag.infra.embedding.openai_embedding import OpenAIEmbeddingProvider
         embed_provider = OpenAIEmbeddingProvider(
             model=embedding_model,
-            dimensions=vector_dimension,
+            dim=vector_dimension,
         )
         vec_index = mgr.faiss
 

@@ -20,6 +20,9 @@ faiss-cpu>=1.7.4
 # Keyword index
 rank-bm25>=0.2.2
 
+# Cross-process locking (guards concurrent ingest against index data loss)
+filelock>=3.13.0
+
 # Reranking
 voyageai>=0.2.0
 

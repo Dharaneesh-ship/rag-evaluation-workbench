@@ -1,12 +1,25 @@
 """Index startup loader — initialises or reloads BM25 and FAISS indexes from disk."""
 
 import logging
+from contextlib import contextmanager
 from pathlib import Path
+
+from filelock import FileLock, Timeout as _FileLockTimeout
 
 from rag.infra.indexes.bm25_local import BM25LocalIndex, _INDEX_FILENAME as _BM25_FILE
 from rag.infra.indexes.faiss_local import FaissLocalIndex, _INDEX_FILENAME as _FAISS_FILE
 
 logger = logging.getLogger(__name__)
+
+_LOCK_FILENAME = ".index.lock"
+
+
+class IndexLockTimeoutError(TimeoutError):
+    """Raised when ``exclusive_session()`` cannot acquire the index lock in time.
+
+    Means another process holds the lock — almost always a concurrent
+    ingest/sync already in progress against the same ``index_dir``.
+    """
 
 
 class IndexManager:
@@ -101,3 +114,61 @@ class IndexManager:
         self.faiss = FaissLocalIndex()
         self._load_if_exists()
         logger.info("Indexes reloaded from '%s'.", self._index_dir)
+
+    @contextmanager
+    def exclusive_session(self, timeout: float = 60.0):
+        """Cross-process-safe load → mutate → save critical section.
+
+        Without this, two concurrent writers (two ingest sessions, or an
+        ingest racing a connector sync) each load a stale in-memory snapshot,
+        mutate it independently, and the second one to finish silently
+        overwrites the first one's additions — the whole-file dump-on-save
+        pattern has no way to detect or merge concurrent changes. This
+        acquires an exclusive file lock, reloads fresh from disk *inside*
+        the lock (discarding any snapshot loaded before the lock was held,
+        which may already be stale), yields ``self`` for the caller to
+        mutate, and saves on clean exit.
+
+        Usage — construct the pipeline *inside* the ``with`` block, not
+        before it, so it references the freshly-reloaded ``bm25``/``faiss``
+        objects rather than a pre-lock snapshot that ``reload()`` replaces::
+
+            mgr = IndexManager(index_dir)
+            with mgr.exclusive_session():
+                pipeline = IngestPipeline(
+                    doc_store, trace_store,
+                    keyword_index=mgr.bm25, vector_index=mgr.faiss,
+                )
+                pipeline.ingest(path)
+            # saved automatically on clean exit
+
+        Args:
+            timeout: Seconds to wait for the lock before giving up.
+                Defaults to 60.
+
+        Yields:
+            ``self`` (for symmetry with the usage pattern above; callers
+            typically just read ``mgr.bm25``/``mgr.faiss`` directly).
+
+        Raises:
+            IndexLockTimeoutError: If the lock isn't acquired within
+                ``timeout`` seconds — another process is holding it.
+        """
+        self._index_dir.mkdir(parents=True, exist_ok=True)
+        lock_path = str(self._index_dir / _LOCK_FILENAME)
+        lock = FileLock(lock_path, timeout=timeout)
+        try:
+            lock.acquire()
+        except _FileLockTimeout as exc:
+            raise IndexLockTimeoutError(
+                f"Could not acquire index lock for '{self._index_dir}' within "
+                f"{timeout}s — another ingest or sync is likely in progress "
+                f"against the same index directory."
+            ) from exc
+
+        try:
+            self.reload()
+            yield self
+            self.save()
+        finally:
+            lock.release()

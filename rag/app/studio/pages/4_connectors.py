@@ -171,34 +171,37 @@ def _render_connector_tab(connector: str) -> None:
             try:
                 from rag.infra.stores.docstore_sqlite import SQLiteDocStore
                 from rag.infra.stores.tracestore_sqlite import SQLiteTraceStore
+                from rag.infra.indexes.index_manager import IndexManager
                 from rag.pipelines.connector_sync_pipeline import ConnectorSyncPipeline
                 from rag.app.mcp_server.wiring import build_ingest_pipeline
 
                 Path(db_path).parent.mkdir(parents=True, exist_ok=True)
                 Path(index_dir).mkdir(parents=True, exist_ok=True)
 
-                ingest_pipeline, index_mgr = build_ingest_pipeline(
-                    db_path=db_path,
-                    index_dir=index_dir,
-                    embedding_provider=emb_provider if emb_provider != "none" else None,
-                )
                 doc_store   = SQLiteDocStore(db_path)
                 trace_store = SQLiteTraceStore(db_path)
                 conn        = _load_connector(connector)
 
-                pipeline = ConnectorSyncPipeline(
-                    connector=conn,
-                    ingest_pipeline=ingest_pipeline,
-                    doc_store=doc_store,
-                    trace_store=trace_store,
-                )
+                index_mgr = IndexManager(index_dir=index_dir)
+                # Locks the load-mutate-save cycle against a concurrent
+                # ingest/sync on the same index_dir; reload happens fresh
+                # inside the lock, save happens automatically on clean exit.
+                with index_mgr.exclusive_session():
+                    ingest_pipeline, _ = build_ingest_pipeline(
+                        db_path=db_path,
+                        index_dir=index_dir,
+                        embedding_provider=emb_provider if emb_provider != "none" else None,
+                        index_mgr=index_mgr,
+                    )
+                    pipeline = ConnectorSyncPipeline(
+                        connector=conn,
+                        ingest_pipeline=ingest_pipeline,
+                        doc_store=doc_store,
+                        trace_store=trace_store,
+                    )
 
-                since = cursor_override.strip() if cursor_override.strip() else None
-                result = pipeline.run(since_cursor=since)
-                # Persist the same IndexManager instance the sync actually
-                # mutated — constructing a fresh IndexManager here would
-                # reload a stale, pre-sync snapshot instead.
-                index_mgr.save()
+                    since = cursor_override.strip() if cursor_override.strip() else None
+                    result = pipeline.run(since_cursor=since)
 
                 # Display results
                 st.success("✅ Sync complete")
