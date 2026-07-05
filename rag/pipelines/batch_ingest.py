@@ -68,12 +68,24 @@ class BatchIngestReport:
         """True when at least one file is not retrievable after the run."""
         return bool(self.problem_results)
 
+    @property
+    def total_cost_usd(self) -> float:
+        """Sum of every result's estimated API cost (embedding + Vision)."""
+        return sum(r.cost_usd for r in self.results)
+
+    @property
+    def total_embed_tokens(self) -> int:
+        """Sum of every result's embedding tokens."""
+        return sum(r.embed_tokens for r in self.results)
+
     def to_metadata(self) -> dict:
         """Serialise the report summary for TraceStore persistence."""
         return {
             "root": self.root,
             "total": self.total,
             "status_counts": self.status_counts,
+            "total_cost_usd": self.total_cost_usd,
+            "total_embed_tokens": self.total_embed_tokens,
             "problem_files": [
                 {"source_path": r.source_path, "status": r.status, "error": r.error}
                 for r in self.problem_results
@@ -88,6 +100,8 @@ class BatchIngestReport:
         lines = [
             f"Batch ingest of '{self.root}': {self.total} file(s)",
             f"  ok: {ok}   skipped (unchanged): {skipped}",
+            f"  estimated cost: ${self.total_cost_usd:.4f} "
+            f"({self.total_embed_tokens:,} embed tokens + any Vision pages)",
         ]
 
         def _section(status: str, label: str) -> None:

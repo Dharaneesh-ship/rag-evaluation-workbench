@@ -22,6 +22,7 @@ from rag.core.utils.hashing import BlockDiffResult, diff_blocks, fingerprint_byt
 from rag.infra.cleaning.cleaner_pipeline import CleanerPipeline
 from rag.infra.chunking.block_splitter_paragraph import ParagraphBlockSplitter
 from rag.infra.chunking.chunk_packer_anchor_aware import AnchorAwareChunkPacker
+from rag.infra.llm.pricing import estimate_cost_usd
 from rag.infra.loading.local_file_loader import (
     DEFAULT_MAX_FILE_SIZE_BYTES,
     LocalFileLoader,
@@ -213,6 +214,20 @@ class IngestResult:
         chunk_count: Number of Chunks stored.
         run_id: TraceStore run identifier.
         elapsed_ms: Total wall-clock time in milliseconds.
+        stage_timings_ms: Per-stage wall-clock time in milliseconds (e.g.
+            ``"load"``, ``"parse"``, ``"clean"``, ``"chunk"``, ``"embed"``,
+            ``"bm25_index"``, ``"faiss_index"``, ``"docstore_write"``,
+            ``"index_save"``). Mirrors the per-step latency already recorded
+            on the query side (``AnswerTrace``). Stages that don't apply to
+            this run (e.g. ``"embed"`` with no embedding_provider) are
+            simply absent, not zero. Values are per-document even under
+            ``ingest_many`` concurrency — they don't reflect wall-clock
+            overlap across files, only this document's own stage costs.
+        embed_tokens: Tokens consumed by the embedding call, if any.
+        cost_usd: Estimated dollar cost of every metered API call this
+            document triggered (embedding + any Vision-LLM page
+            transcriptions during parsing). 0.0 when no paid API was used
+            (e.g. BM25-only with a free/local parser tier).
         skipped: True if the document was already up-to-date and skipped.
         error: Error message if ingestion failed, or None on success.
         status: Explicit outcome of the run. One of:
@@ -232,7 +247,9 @@ class IngestResult:
     chunk_count: int = 0
     run_id: str = ""
     elapsed_ms: float = 0.0
+    stage_timings_ms: dict[str, float] = field(default_factory=dict)
     embed_tokens: int = 0
+    cost_usd: float = 0.0
     skipped: bool = False
     error: str | None = None
     status: str = "ok"
@@ -264,6 +281,8 @@ class _Prepared:
     prev_doc_id: str | None
     prev_chunk_ids: list[str]
     block_diff: Optional[BlockDiffResult]
+    stage_timings_ms: dict[str, float] = field(default_factory=dict)
+    cost_usd: float = 0.0
 
 
 class IngestPipeline:
@@ -572,7 +591,9 @@ class IngestPipeline:
                 "block_count": result.block_count,
                 "chunk_count": result.chunk_count,
                 "embed_tokens": result.embed_tokens,
+                "cost_usd": result.cost_usd,
                 "elapsed_ms": result.elapsed_ms,
+                "stage_timings_ms": result.stage_timings_ms,
                 "error": result.error,
                 "status": result.status,
             },
@@ -670,7 +691,9 @@ class IngestPipeline:
                     "block_count": result.block_count,
                     "chunk_count": result.chunk_count,
                     "embed_tokens": result.embed_tokens,
+                    "cost_usd": result.cost_usd,
                     "elapsed_ms": result.elapsed_ms,
+                    "stage_timings_ms": result.stage_timings_ms,
                     "error": result.error,
                     "status": result.status,
                 },
@@ -783,13 +806,16 @@ class IngestPipeline:
         # stale-chunk lookup. When the file is a temp upload, canonical_name
         # is the original filename so re-ingests find the previous version.
         canonical = canonical_name if canonical_name else source_path
+        timings: dict[str, float] = {}
 
         # 1. Load
+        t0 = time.monotonic()
         artifact = self._loader.load(source_path)
 
         # 1b. Fingerprint — detect unchanged documents before deep processing
         content_hash = fingerprint_bytes(artifact.raw_bytes)
         doc_id = make_doc_id(canonical, content_hash)
+        timings["load"] = (time.monotonic() - t0) * 1000
 
         if self._doc_store.document_exists(doc_id):
             logger.info(
@@ -804,12 +830,17 @@ class IngestPipeline:
             )
 
         # 2. Sniff
+        t0 = time.monotonic()
         sniff_result = self._sniffer.sniff(artifact)
         logger.debug("Detected type: %s", sniff_result.detected_type)
 
-        # 3. Route + Parse
+        # 3. Route + Parse — this is where the Vision-LLM tiers (pdf_vision,
+        # pdf_hybrid) make their API calls, so "parse" is often the dominant
+        # cost for complex PDFs. Timed together with sniff/route since those
+        # are near-instant by comparison.
         plan = self._orchestrator.route(sniff_result)
         document = self._orchestrator.parse(artifact, plan)
+        timings["parse"] = (time.monotonic() - t0) * 1000
 
         # 3b. Unsupported format — refuse to store the placeholder document.
         # Indexing "[unsupported_format: ...]" text would pollute retrieval
@@ -866,9 +897,12 @@ class IngestPipeline:
                 )
 
         # 6. Clean
+        t0 = time.monotonic()
         cleaned_blocks = self._cleaner.run(document.blocks)
+        timings["clean"] = (time.monotonic() - t0) * 1000
 
         # 7. Split into TextBlocks
+        t0 = time.monotonic()
         text_blocks = self._splitter.split(doc_id, cleaned_blocks)
 
         # 7b. Block diff — compare new blocks against the previous version
@@ -900,12 +934,15 @@ class IngestPipeline:
             c.model_copy(update={"chunk_id": c.chunk_id or c.chunk_signature})
             for c in chunks
         ]
+        timings["chunk"] = (time.monotonic() - t0) * 1000  # split + pack combined
 
         # 9. Embed (optional). Indexing (keyword_index.add / vector_index.add)
         # happens in _commit() — it mutates the shared in-memory index and
         # must run on a single thread.
         embed_tokens = 0
+        embed_cost_usd = 0.0
         if self._embedding_provider is not None and chunks:
+            t0 = time.monotonic()
             texts = [c.stable_text for c in chunks]
             embed_result = self._embedding_provider.embed(texts)
             embed_tokens = getattr(embed_result, "prompt_tokens", 0)
@@ -924,9 +961,19 @@ class IngestPipeline:
                 c.model_copy(update={"embedding": vec})
                 for c, vec in zip(chunks, vectors)
             ]
+            timings["embed"] = (time.monotonic() - t0) * 1000
+            embedding_model = getattr(self._embedding_provider, "model", None)
+            embed_cost_usd = estimate_cost_usd(embedding_model, embed_tokens) if embedding_model else 0.0
             logger.debug(
-                "Embedded %d chunks using %d tokens.", len(chunks), embed_tokens
+                "Embedded %d chunks using %d tokens ($%.5f).",
+                len(chunks), embed_tokens, embed_cost_usd,
             )
+
+        # Vision-LLM parsing (pdf_vision / pdf_hybrid) tracks its own token
+        # usage and cost in Document.metadata (captured during step 3/"parse"
+        # above) since it happens inside the orchestrator, not here.
+        vision_cost_usd = document.metadata.get("vision_cost_usd", 0.0)
+        cost_usd = embed_cost_usd + vision_cost_usd
 
         return _Prepared(
             doc_id=doc_id,
@@ -940,6 +987,8 @@ class IngestPipeline:
             prev_doc_id=prev_doc_id,
             prev_chunk_ids=prev_chunk_ids,
             block_diff=block_diff,
+            stage_timings_ms=timings,
+            cost_usd=cost_usd,
         )
 
     def _commit(self, prepared: "_Prepared", run_id: str) -> IngestResult:
@@ -968,24 +1017,31 @@ class IngestPipeline:
         prev_doc_id = prepared.prev_doc_id
         prev_chunk_ids = prepared.prev_chunk_ids
         block_diff = prepared.block_diff
+        timings = dict(prepared.stage_timings_ms)
 
         # 5. Store document
+        t0 = time.monotonic()
         self._doc_store.save_document(document)
-
         self._doc_store.save_text_blocks(text_blocks)
 
         # 9. Index
         # Keyword (BM25) indexing needs no vectors, so it must not be gated on
         # embedding_provider — BM25-only mode (embedding_provider=None) is a
         # supported configuration and must still populate the keyword index.
-        if self._embedding_provider is not None and chunks:
-            if self._vector_index is not None:
-                self._vector_index.add(chunks, rebuild=not self._batch_mode)
+        if self._embedding_provider is not None and chunks and self._vector_index is not None:
+            t1 = time.monotonic()
+            self._vector_index.add(chunks, rebuild=not self._batch_mode)
+            timings["faiss_index"] = (time.monotonic() - t1) * 1000
 
         if self._keyword_index is not None and chunks:
+            t1 = time.monotonic()
             self._keyword_index.add(chunks, rebuild=not self._batch_mode)
+            timings["bm25_index"] = (time.monotonic() - t1) * 1000
 
         self._doc_store.save_chunks(chunks)
+        timings["docstore_write"] = (time.monotonic() - t0) * 1000 - timings.get(
+            "faiss_index", 0.0
+        ) - timings.get("bm25_index", 0.0)
 
         # 9b. Remove stale chunks from indexes (Task 11.5)
         if prev_chunk_ids:
@@ -1010,9 +1066,13 @@ class IngestPipeline:
 
         # 9c. Persist updated indexes to disk (Task 11.5) — deferred to
         # end_batch() when a batch is in progress, so a batch of N documents
-        # writes the full index to disk once instead of N times.
+        # writes the full index to disk once instead of N times. Absent from
+        # stage_timings_ms (not zero) for any document ingested during a
+        # batch — the real disk-write cost lands once in end_batch() instead.
         if not self._batch_mode:
+            t0 = time.monotonic()
             self._persist_indexes()
+            timings["index_save"] = (time.monotonic() - t0) * 1000
 
         # 9d. Delete old document version from DocStore (Task 11.5)
         if prev_doc_id and prev_doc_id != doc_id:
@@ -1062,7 +1122,9 @@ class IngestPipeline:
             block_count=len(text_blocks),
             chunk_count=len(chunks),
             run_id=run_id,
+            stage_timings_ms=timings,
             embed_tokens=embed_tokens,
+            cost_usd=prepared.cost_usd,
             skipped=False,
             status=status,
             blocks_added=block_diff.added_count if block_diff else 0,

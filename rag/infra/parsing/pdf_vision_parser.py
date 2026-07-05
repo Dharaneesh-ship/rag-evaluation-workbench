@@ -25,6 +25,7 @@ import base64
 import io
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Optional
@@ -34,6 +35,7 @@ from rag.core.contracts.ir_block import BlockType, IRBlock
 from rag.core.contracts.parse_report import ParseReport
 from rag.core.interfaces.page_renderer import BasePageRenderer
 from rag.core.interfaces.parser import BaseParser
+from rag.infra.llm.pricing import estimate_cost_usd
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +65,27 @@ _PAGE_PROMPT = (
     "- Do not add commentary, preamble, or code fences.\n"
     "- If the page is blank, respond with exactly: [BLANK_PAGE]"
 )
+
+
+@dataclass
+class PageResult:
+    """Outcome of transcribing one PDF page with the Vision LLM.
+
+    Attributes:
+        blocks: IRBlocks extracted from the page (empty for blank pages).
+        truncated: True when the model's transcript was cut off early
+            (output token cap or content-filter cut) — the blocks may be
+            incomplete and callers should prefer another source for this
+            page (e.g. text-parser blocks) when possible.
+        prompt_tokens: Input tokens billed for this page's API call
+            (dominated by the rendered page image at "high" detail).
+        completion_tokens: Output tokens billed for this page's transcript.
+    """
+
+    blocks: list[IRBlock] = field(default_factory=list)
+    truncated: bool = False
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
 
 
 def _starts_with_ordinal(text: str) -> bool:
@@ -156,6 +179,11 @@ class PdfVisionParser(BaseParser):
         self._max_workers = max_workers
         self._client = OpenAI(api_key=api_key) if api_key else OpenAI()
 
+    @property
+    def model(self) -> str:
+        """The vision-capable model id used by this parser (for cost estimation)."""
+        return self._model
+
     def supports(self, mime_type: str) -> bool:
         """Return True for PDF MIME types."""
         return mime_type in ("application/pdf", "application/x-pdf")
@@ -166,16 +194,17 @@ class PdfVisionParser(BaseParser):
         image.save(buffer, format="PNG")
         return base64.b64encode(buffer.getvalue()).decode("ascii")
 
-    def _transcribe_page(self, image: Any) -> tuple[str, bool]:
+    def _transcribe_page(self, image: Any) -> tuple[str, bool, int, int]:
         """Send one page image to the vision model and return its Markdown.
 
         Args:
             image: PIL Image of the rendered page.
 
         Returns:
-            ``(markdown, truncated)`` where ``truncated`` is True when the
-            model stopped early (output token cap or content-filter cut),
-            meaning the transcript may be missing page content.
+            ``(markdown, truncated, prompt_tokens, completion_tokens)`` where
+            ``truncated`` is True when the model stopped early (output token
+            cap or content-filter cut), meaning the transcript may be
+            missing page content.
         """
         b64 = self._encode_image(image)
         response = self._client.chat.completions.create(
@@ -208,11 +237,12 @@ class PdfVisionParser(BaseParser):
                 "extraction for this page.",
                 finish_reason,
             )
-        return choice.message.content or "", truncated
+        usage = response.usage
+        prompt_tokens = usage.prompt_tokens if usage else 0
+        completion_tokens = usage.completion_tokens if usage else 0
+        return choice.message.content or "", truncated, prompt_tokens, completion_tokens
 
-    def parse_page_blocks(
-        self, source_path: str, page_num: int
-    ) -> tuple[list[IRBlock], bool]:
+    def parse_page_blocks(self, source_path: str, page_num: int) -> PageResult:
         """Transcribe a single page and return its IRBlocks.
 
         Used by the hybrid parser to escalate individual complex pages
@@ -223,18 +253,22 @@ class PdfVisionParser(BaseParser):
             page_num: 1-based page number.
 
         Returns:
-            ``(blocks, truncated)`` — IRBlocks for the page (empty for blank
-            pages), and whether the transcript was cut off early. On a
-            truncated transcript the blocks are partial and the caller should
-            prefer the text-parser extraction for this page.
+            A ``PageResult``. On a truncated transcript the blocks are
+            partial and the caller should prefer the text-parser extraction
+            for this page.
         """
         image = self._renderer.render(source_path, page_num)
-        markdown, truncated = self._transcribe_page(image)
-        return _markdown_to_blocks(markdown, page_num), truncated
+        markdown, truncated, prompt_tokens, completion_tokens = self._transcribe_page(image)
+        return PageResult(
+            blocks=_markdown_to_blocks(markdown, page_num),
+            truncated=truncated,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+        )
 
     def parse_pages_parallel(
         self, source_path: str, page_nums: list[int]
-    ) -> dict[int, tuple[list[IRBlock], bool, Optional[BaseException]]]:
+    ) -> dict[int, tuple[PageResult, Optional[BaseException]]]:
         """Transcribe multiple pages concurrently via a thread pool.
 
         Each page is an independent render+API-call unit, so pages are
@@ -247,13 +281,13 @@ class PdfVisionParser(BaseParser):
             page_nums: 1-based page numbers to transcribe.
 
         Returns:
-            Dict mapping page_num to ``(blocks, truncated, exception)``.
-            ``exception`` is None on success; when set, ``blocks`` is empty
-            and ``truncated`` is False — callers should fall back to
-            another source for that page (e.g. text-parser blocks) exactly
-            as they would for a sequential per-page exception.
+            Dict mapping page_num to ``(PageResult, exception)``.
+            ``exception`` is None on success; when set, the ``PageResult`` is
+            empty/default — callers should fall back to another source for
+            that page (e.g. text-parser blocks) exactly as they would for a
+            sequential per-page exception.
         """
-        results: dict[int, tuple[list[IRBlock], bool, Optional[BaseException]]] = {}
+        results: dict[int, tuple[PageResult, Optional[BaseException]]] = {}
         if not page_nums:
             return results
 
@@ -266,10 +300,9 @@ class PdfVisionParser(BaseParser):
             for future in as_completed(future_to_page):
                 page_num = future_to_page[future]
                 try:
-                    blocks, truncated = future.result()
-                    results[page_num] = (blocks, truncated, None)
+                    results[page_num] = (future.result(), None)
                 except Exception as exc:  # noqa: BLE001 - surfaced to caller
-                    results[page_num] = ([], False, exc)
+                    results[page_num] = (PageResult(), exc)
         return results
 
     def parse(self, source_path: str) -> Document:
@@ -304,7 +337,7 @@ class PdfVisionParser(BaseParser):
         # this to record the failure and fall through. We still get the
         # parallelism benefit for the (expected) all-success case.
         for page_num in page_nums:
-            _, _, exc = page_results[page_num]
+            _, exc = page_results[page_num]
             if exc is not None:
                 raise RuntimeError(
                     f"Vision parse failed for page {page_num}/{end_page} of "
@@ -313,16 +346,25 @@ class PdfVisionParser(BaseParser):
 
         all_blocks: list[IRBlock] = []
         page_char_counts: list[int] = []
+        total_prompt_tokens = 0
+        total_completion_tokens = 0
 
         for page_num in page_nums:
-            page_blocks, _truncated, _exc = page_results[page_num]
-            all_blocks.extend(page_blocks)
-            page_chars = sum(len(b.text) for b in page_blocks)
+            page_result, _exc = page_results[page_num]
+            all_blocks.extend(page_result.blocks)
+            page_chars = sum(len(b.text) for b in page_result.blocks)
             page_char_counts.append(page_chars)
+            total_prompt_tokens += page_result.prompt_tokens
+            total_completion_tokens += page_result.completion_tokens
             logger.debug(
-                "Vision page %d/%d: %d blocks, %d chars",
-                page_num, end_page, len(page_blocks), page_chars,
+                "Vision page %d/%d: %d blocks, %d chars, %d+%d tokens",
+                page_num, end_page, len(page_result.blocks), page_chars,
+                page_result.prompt_tokens, page_result.completion_tokens,
             )
+
+        cost_usd = estimate_cost_usd(
+            self._model, total_prompt_tokens, total_completion_tokens
+        )
 
         report = ParseReport(
             char_count=sum(page_char_counts),
@@ -346,5 +388,8 @@ class PdfVisionParser(BaseParser):
                 "vision_model": self._model,
                 "page_count": end_page,
                 "page_char_counts": page_char_counts,
+                "vision_prompt_tokens": total_prompt_tokens,
+                "vision_completion_tokens": total_completion_tokens,
+                "vision_cost_usd": cost_usd,
             },
         )

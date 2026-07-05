@@ -126,11 +126,12 @@ def main(argv: list[str] | None = None) -> int:
 
     elapsed_s = result.elapsed_ms / 1000
     status_note = f" [{result.status}]" if result.status != "ok" else ""
+    cost_note = f", ${result.cost_usd:.4f}" if result.cost_usd else ""
     print(
         f"Ingested '{source_path.name}' — "
         f"{result.chunk_count} chunks, "
         f"{result.block_count} blocks, "
-        f"{elapsed_s:.2f}s{status_note}"
+        f"{elapsed_s:.2f}s{cost_note}{status_note}"
     )
     return 0
 

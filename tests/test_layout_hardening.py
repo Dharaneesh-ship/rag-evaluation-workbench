@@ -150,7 +150,7 @@ class TestVisionTruncationWarning:
 
         parser = self._make_parser("length")
         with caplog.at_level(logging.WARNING):
-            text, truncated = parser._transcribe_page(MagicMock())
+            text, truncated, _pt, _ct = parser._transcribe_page(MagicMock())
         assert text == "partial transcript"
         assert truncated is True
         assert any("truncated" in r.message for r in caplog.records)
@@ -162,15 +162,26 @@ class TestVisionTruncationWarning:
 
         parser = self._make_parser("content_filter")
         with caplog.at_level(logging.WARNING):
-            text, truncated = parser._transcribe_page(MagicMock())
+            text, truncated, _pt, _ct = parser._transcribe_page(MagicMock())
         assert truncated is True
         assert any("truncated" in r.message for r in caplog.records)
 
     def test_complete_transcript_not_flagged(self):
         parser = self._make_parser("stop", content="full page")
-        text, truncated = parser._transcribe_page(MagicMock())
+        text, truncated, _pt, _ct = parser._transcribe_page(MagicMock())
         assert text == "full page"
         assert truncated is False
+
+    def test_token_usage_captured(self):
+        parser = self._make_parser("stop", content="full page")
+        resp = parser._client.chat.completions.create.return_value
+        resp.usage.prompt_tokens = 1200
+        resp.usage.completion_tokens = 300
+        _text, _truncated, prompt_tokens, completion_tokens = parser._transcribe_page(
+            MagicMock()
+        )
+        assert prompt_tokens == 1200
+        assert completion_tokens == 300
 
 
 class TestParsePagesParallel:
@@ -187,39 +198,52 @@ class TestParsePagesParallel:
         return parser
 
     def test_returns_result_per_page_in_success_case(self):
+        from rag.infra.parsing.pdf_vision_parser import PageResult
+
         def fake(source_path, page_num):
-            return [IRBlock(block_type=BlockType.PARAGRAPH, text=f"page {page_num}", page=page_num)], False
+            return PageResult(
+                blocks=[IRBlock(block_type=BlockType.PARAGRAPH, text=f"page {page_num}", page=page_num)],
+                prompt_tokens=100,
+                completion_tokens=20,
+            )
 
         parser = self._make_parser(fake)
         results = parser.parse_pages_parallel("doc.pdf", [1, 2, 3])
 
         assert set(results.keys()) == {1, 2, 3}
         for page_num in (1, 2, 3):
-            blocks, truncated, exc = results[page_num]
+            page_result, exc = results[page_num]
             assert exc is None
-            assert truncated is False
-            assert blocks[0].text == f"page {page_num}"
+            assert page_result.truncated is False
+            assert page_result.blocks[0].text == f"page {page_num}"
+            assert page_result.prompt_tokens == 100
 
     def test_empty_page_list_returns_empty_dict(self):
-        parser = self._make_parser(lambda source_path, page_num: ([], False))
+        from rag.infra.parsing.pdf_vision_parser import PageResult
+
+        parser = self._make_parser(lambda source_path, page_num: PageResult())
         assert parser.parse_pages_parallel("doc.pdf", []) == {}
 
     def test_per_page_exception_isolated_not_raised(self):
         # A single page's API failure must not prevent other pages from
         # being processed, and must not raise out of parse_pages_parallel —
         # callers (hybrid parser) handle per-page fallback themselves.
+        from rag.infra.parsing.pdf_vision_parser import PageResult
+
         def fake(source_path, page_num):
             if page_num == 2:
                 raise RuntimeError("API down")
-            return [IRBlock(block_type=BlockType.PARAGRAPH, text="ok", page=page_num)], False
+            return PageResult(
+                blocks=[IRBlock(block_type=BlockType.PARAGRAPH, text="ok", page=page_num)]
+            )
 
         parser = self._make_parser(fake)
         results = parser.parse_pages_parallel("doc.pdf", [1, 2, 3])
 
-        assert results[1][2] is None and results[3][2] is None
-        _, _, exc2 = results[2]
+        assert results[1][1] is None and results[3][1] is None
+        page_result2, exc2 = results[2]
         assert isinstance(exc2, RuntimeError)
-        assert results[2][0] == []  # empty blocks on failure
+        assert page_result2.blocks == []  # empty blocks on failure
 
     def test_concurrency_bounded_by_max_workers(self):
         # Track the peak number of concurrently-executing calls to prove
@@ -227,6 +251,8 @@ class TestParsePagesParallel:
         # respecting the max_workers cap.
         import threading
         import time
+
+        from rag.infra.parsing.pdf_vision_parser import PageResult
 
         lock = threading.Lock()
         state = {"active": 0, "peak": 0}
@@ -238,7 +264,7 @@ class TestParsePagesParallel:
             time.sleep(0.05)
             with lock:
                 state["active"] -= 1
-            return [], False
+            return PageResult()
 
         parser = self._make_parser(fake, max_workers=3)
         parser.parse_pages_parallel("doc.pdf", list(range(1, 7)))
@@ -269,11 +295,17 @@ class TestDrawingAreaTrigger:
         doc.save(pdf_path)
         doc.close()
 
+        from rag.infra.parsing.pdf_vision_parser import PageResult
+
         vision = MagicMock()
+        vision.model = "gpt-4o-mini"
         vision.parse_pages_parallel.return_value = {
             1: (
-                [IRBlock(block_type=BlockType.IMAGE_CAPTION, text="Figure: bars.", page=1)],
-                False,
+                PageResult(
+                    blocks=[IRBlock(block_type=BlockType.IMAGE_CAPTION, text="Figure: bars.", page=1)],
+                    prompt_tokens=500,
+                    completion_tokens=50,
+                ),
                 None,
             )
         }
@@ -287,6 +319,8 @@ class TestDrawingAreaTrigger:
         vision.parse_pages_parallel.assert_called_once()
         reasons = document.metadata["vision_page_reasons"]["1"]
         assert "drawing_area" in reasons
+        assert document.metadata["vision_prompt_tokens"] == 500
+        assert document.metadata["vision_completion_tokens"] == 50
 
 
 class TestMarkdownArtifactStripping:
@@ -452,8 +486,10 @@ def chart_image(tmp_path):
 class TestPdfHybridParser:
     def _make_hybrid(self, vision_blocks=None, truncated=False, exc=None, **kwargs):
         from rag.infra.parsing.pdf_hybrid_parser import PdfHybridParser
+        from rag.infra.parsing.pdf_vision_parser import PageResult
 
         vision = MagicMock()
+        vision.model = "gpt-4o-mini"
         blocks = vision_blocks or [
             IRBlock(
                 block_type=BlockType.IMAGE_CAPTION,
@@ -463,7 +499,10 @@ class TestPdfHybridParser:
         ]
 
         def fake_parse_pages_parallel(source_path, page_nums):
-            return {p: (blocks, truncated, exc) for p in page_nums}
+            page_result = PageResult(
+                blocks=blocks, truncated=truncated, prompt_tokens=800, completion_tokens=100
+            )
+            return {p: (page_result, exc) for p in page_nums}
 
         vision.parse_pages_parallel.side_effect = fake_parse_pages_parallel
         return PdfHybridParser(

@@ -717,6 +717,113 @@ class TestIngestMany:
 
 
 # ---------------------------------------------------------------------------
+# Per-document stage timing and cost tracking
+# ---------------------------------------------------------------------------
+
+
+class TestStageTimingsAndCost:
+    def _make_pipeline(self, tmp_path, **kwargs):
+        from rag.infra.stores.docstore_sqlite import SQLiteDocStore
+        from rag.infra.stores.tracestore_sqlite import SQLiteTraceStore
+        from rag.pipelines.ingest_pipeline import IngestPipeline
+
+        db = tmp_path / "test.db"
+        return IngestPipeline(SQLiteDocStore(db), SQLiteTraceStore(db), **kwargs)
+
+    def _write_doc(self, tmp_path, name="doc.md"):
+        f = tmp_path / name
+        f.write_text("# Title\n\nContent about cats and dogs with enough words.")
+        return f
+
+    def test_stage_timings_present_for_bm25_only_ingest(self, tmp_path):
+        from rag.infra.indexes.bm25_local import BM25LocalIndex
+
+        pipeline = self._make_pipeline(tmp_path, keyword_index=BM25LocalIndex())
+        result = pipeline.ingest(self._write_doc(tmp_path))
+
+        assert result.status == "ok"
+        for stage in ("load", "parse", "clean", "chunk", "bm25_index", "index_save"):
+            assert stage in result.stage_timings_ms, f"missing stage: {stage}"
+            assert result.stage_timings_ms[stage] >= 0
+
+    def test_embed_stage_absent_without_embedding_provider(self, tmp_path):
+        pipeline = self._make_pipeline(tmp_path)
+        result = pipeline.ingest(self._write_doc(tmp_path))
+        assert "embed" not in result.stage_timings_ms
+        assert "faiss_index" not in result.stage_timings_ms
+
+    def test_embed_stage_present_with_embedding_provider(self, tmp_path):
+        embed_result = MagicMock(prompt_tokens=42)
+        embed_result.vectors = [[0.1, 0.2]]
+        provider = MagicMock()
+        provider.model = "text-embedding-3-small"
+        provider.embed.return_value = embed_result
+        provider.embed_with_usage.return_value = embed_result
+        vector_index = MagicMock()
+
+        pipeline = self._make_pipeline(
+            tmp_path, embedding_provider=provider, vector_index=vector_index
+        )
+        result = pipeline.ingest(self._write_doc(tmp_path))
+
+        assert result.status == "ok"
+        assert "embed" in result.stage_timings_ms
+        assert "faiss_index" in result.stage_timings_ms
+        assert result.embed_tokens == 42
+
+    def test_index_save_absent_during_batch_mode(self, tmp_path):
+        from rag.infra.indexes.bm25_local import BM25LocalIndex
+
+        pipeline = self._make_pipeline(tmp_path, keyword_index=BM25LocalIndex())
+        pipeline.begin_batch()
+        result = pipeline.ingest(self._write_doc(tmp_path))
+        pipeline.end_batch()
+
+        # Deferred to end_batch(), not per-document — absent, not zero.
+        assert "index_save" not in result.stage_timings_ms
+
+    def test_cost_usd_zero_without_embedding_or_vision(self, tmp_path):
+        result = self._make_pipeline(tmp_path).ingest(self._write_doc(tmp_path))
+        assert result.cost_usd == 0.0
+
+    def test_cost_usd_reflects_embedding_cost(self, tmp_path):
+        from rag.infra.llm.pricing import estimate_cost_usd
+
+        embed_result = MagicMock(prompt_tokens=100_000)
+        embed_result.vectors = [[0.1, 0.2]]
+        provider = MagicMock()
+        provider.model = "text-embedding-3-small"
+        provider.embed.return_value = embed_result
+        provider.embed_with_usage.return_value = embed_result
+
+        pipeline = self._make_pipeline(tmp_path, embedding_provider=provider)
+        result = pipeline.ingest(self._write_doc(tmp_path))
+
+        expected = estimate_cost_usd("text-embedding-3-small", 100_000)
+        assert result.cost_usd == pytest.approx(expected)
+        assert result.cost_usd > 0
+
+    def test_cost_usd_includes_vision_cost_from_document_metadata(self, tmp_path, monkeypatch):
+        # Vision-tier parsers (pdf_vision/pdf_hybrid) record their own token
+        # usage and cost directly on Document.metadata during parsing (they
+        # run inside the orchestrator, not _prepare() itself). _prepare()
+        # must roll that into IngestResult.cost_usd alongside embedding cost.
+        pipeline = self._make_pipeline(tmp_path)
+        original_parse = pipeline._orchestrator.parse
+
+        def fake_parse(artifact, plan):
+            doc = original_parse(artifact, plan)
+            return doc.model_copy(
+                update={"metadata": {**doc.metadata, "vision_cost_usd": 0.0123}}
+            )
+
+        monkeypatch.setattr(pipeline._orchestrator, "parse", fake_parse)
+        result = pipeline.ingest(self._write_doc(tmp_path))
+
+        assert result.cost_usd == pytest.approx(0.0123)
+
+
+# ---------------------------------------------------------------------------
 # Batch ingest report
 # ---------------------------------------------------------------------------
 
@@ -832,6 +939,42 @@ class TestBatchIngest:
         report = BatchIngestRunner(p).run(docs)
         assert report.has_problems is False
         assert "✓" in report.format_summary()
+
+    def test_total_cost_and_tokens_aggregate_across_files(self, tmp_path):
+        from rag.infra.stores.docstore_sqlite import SQLiteDocStore
+        from rag.infra.stores.tracestore_sqlite import SQLiteTraceStore
+        from rag.infra.llm.pricing import estimate_cost_usd
+        from rag.pipelines.batch_ingest import BatchIngestRunner
+        from rag.pipelines.ingest_pipeline import IngestPipeline
+
+        embed_result = MagicMock(prompt_tokens=1000)
+        embed_result.vectors = [[0.1, 0.2]]
+        provider = MagicMock()
+        provider.model = "text-embedding-3-small"
+        provider.embed.return_value = embed_result
+        provider.embed_with_usage.return_value = embed_result
+
+        db = tmp_path / "t.db"
+        p = IngestPipeline(
+            SQLiteDocStore(db), SQLiteTraceStore(db), embedding_provider=provider
+        )
+        docs = tmp_path / "corpus"
+        docs.mkdir()
+        for name in ("a", "b", "c"):
+            (docs / f"{name}.md").write_text(
+                f"# {name}\n\nContent about {name} with enough words for the gate."
+            )
+
+        report = BatchIngestRunner(p).run(docs)
+
+        assert report.total_embed_tokens == 3000  # 3 files x 1000 tokens each
+        expected_cost = 3 * estimate_cost_usd("text-embedding-3-small", 1000)
+        assert report.total_cost_usd == pytest.approx(expected_cost)
+        assert f"${report.total_cost_usd:.4f}" in report.format_summary()
+
+        meta = report.to_metadata()
+        assert meta["total_embed_tokens"] == 3000
+        assert meta["total_cost_usd"] == pytest.approx(expected_cost)
 
 
 # ---------------------------------------------------------------------------

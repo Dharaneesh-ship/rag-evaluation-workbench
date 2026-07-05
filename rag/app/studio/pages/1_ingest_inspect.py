@@ -369,11 +369,14 @@ if results_raw:
             f"{n_err} failed out of {total}."
         )
 
-    c1, c2, c3, c4 = st.columns(4)
+    total_cost = sum(getattr(r, "cost_usd", 0.0) for r in results)
+
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Total blocks", sum(r.block_count for r in results))
     c2.metric("Total chunks", sum(r.chunk_count for r in results))
     c3.metric("Total elapsed", f"{sum(r.elapsed_ms for r in results):.0f} ms")
     c4.metric("Total embed tokens", sum(r.embed_tokens for r in results))
+    c5.metric("Est. cost", f"${total_cost:.4f}")
 
     if total > 1:
         for fname, result in named_results:
@@ -394,11 +397,21 @@ if results_raw:
                 )
             else:
                 with st.expander(f"✅ {fname}  ·  {result.chunk_count} chunks  ·  {result.elapsed_ms:.0f} ms"):
-                    cc1, cc2, cc3, cc4 = st.columns(4)
+                    cc1, cc2, cc3, cc4, cc5 = st.columns(5)
                     cc1.metric("Blocks", result.block_count)
                     cc2.metric("Chunks", result.chunk_count)
                     cc3.metric("Elapsed", f"{result.elapsed_ms:.0f} ms")
                     cc4.metric("Embed tokens", result.embed_tokens)
+                    cc5.metric("Est. cost", f"${getattr(result, 'cost_usd', 0.0):.4f}")
+
+                    stage_timings = getattr(result, "stage_timings_ms", None)
+                    if stage_timings:
+                        st.caption(
+                            "Stage timings: "
+                            + " · ".join(
+                                f"{stage}={ms:.0f}ms" for stage, ms in stage_timings.items()
+                            )
+                        )
 
 st.divider()
 

@@ -60,6 +60,11 @@ class OpenAIEmbeddingProvider(BaseEmbeddingProvider):
         """Dimensionality of the embedding vectors produced by this provider."""
         return self._dim
 
+    @property
+    def model(self) -> str:
+        """The OpenAI embedding model id used by this provider (for cost estimation)."""
+        return self._model
+
     def embed(self, texts: list[str]) -> list[list[float]]:
         """Embed a batch of texts using the OpenAI Embeddings API.
 

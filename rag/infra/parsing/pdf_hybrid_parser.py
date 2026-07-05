@@ -29,6 +29,7 @@ from rag.core.contracts.document import Document
 from rag.core.contracts.ir_block import IRBlock
 from rag.core.contracts.parse_report import ParseReport
 from rag.core.interfaces.parser import BaseParser
+from rag.infra.llm.pricing import estimate_cost_usd
 from rag.infra.parsing.pdf_pymupdf import PdfPyMuPDFParser
 from rag.infra.parsing.pdf_vision_parser import PdfVisionParser
 
@@ -249,8 +250,15 @@ class PdfHybridParser(BaseParser):
 
         vision_blocks: dict[int, list[IRBlock]] = {}
         truncated_pages: list[int] = []
+        total_prompt_tokens = 0
+        total_completion_tokens = 0
         for info in complex_pages:
-            blocks, truncated, exc = page_results[info.page]
+            page_result, exc = page_results[info.page]
+            # Tokens are billed whether or not the result is usable (a
+            # truncated/failed call still consumed API tokens), so they're
+            # counted here regardless of the branch below.
+            total_prompt_tokens += page_result.prompt_tokens
+            total_completion_tokens += page_result.completion_tokens
 
             if exc is not None:
                 logger.warning(
@@ -262,7 +270,7 @@ class PdfHybridParser(BaseParser):
                 )
                 continue
 
-            if truncated:
+            if page_result.truncated:
                 truncated_pages.append(info.page)
                 logger.warning(
                     "Vision transcript for page %d of '%s' was truncated — "
@@ -273,7 +281,7 @@ class PdfHybridParser(BaseParser):
                 )
                 continue
 
-            vision_blocks[info.page] = blocks
+            vision_blocks[info.page] = page_result.blocks
 
         # Splice: replace text blocks of vision-parsed pages, keep the rest.
         text_blocks_by_page: dict[int, list[IRBlock]] = {}
@@ -313,6 +321,13 @@ class PdfHybridParser(BaseParser):
                     # Pages we tried to escalate but whose transcript was cut
                     # off; text-parser blocks were kept for these.
                     "vision_truncated_pages": sorted(truncated_pages),
+                    "vision_prompt_tokens": total_prompt_tokens,
+                    "vision_completion_tokens": total_completion_tokens,
+                    "vision_cost_usd": estimate_cost_usd(
+                        self._vision_parser.model,
+                        total_prompt_tokens,
+                        total_completion_tokens,
+                    ),
                 },
             }
         )
