@@ -6,6 +6,103 @@ A modular, pluggable Retrieval-Augmented Generation (RAG) framework with hybrid 
 
 ---
 
+## Why this project exists
+
+Most RAG tutorials wire together a vector store and an LLM call and stop there.
+This project is an attempt to build the parts that tutorials skip, and to
+measure whether they actually work rather than assume it:
+
+- **Every stage is swappable behind an interface** — parser, embedder,
+  vector index, keyword index, reranker, LLM client — so a chunking or
+  reranking change is a config change, not a rewrite (see
+  [Architecture](#architecture) below).
+- **Every retrieval claim is backed by a real evaluation, not intuition.**
+  Chunk size, hybrid retrieval, reranking, and LLM metadata enrichment were
+  each tested with a human-labeled QA dataset and reported honestly —
+  including the one that turned out to be a **null result**. See
+  [Results at a glance](#results-at-a-glance) and the full write-up in
+  [EVAL_RESULTS.md](EVAL_RESULTS.md).
+- **Production concerns are treated as first-class**, not afterthoughts:
+  cross-process file locking so concurrent ingests can't silently lose data,
+  MCP stdio hardened against protocol corruption, per-document cost/timing
+  tracking, and a batch-ingest path with a proven O(1)-in-`max_workers`
+  memory bound rather than one that merely looks bounded.
+
+This is a solo, from-scratch build (no RAG framework/template as a starting
+point) used as a vehicle to learn production ML-systems engineering —
+chunking strategy, hybrid retrieval, evaluation methodology, and the
+unglamorous reliability work (concurrency, memory, protocol safety) that
+tutorials rarely cover. See [Known limitations](#known-limitations) for what
+it deliberately does not claim.
+
+---
+
+## Architecture
+
+```mermaid
+flowchart LR
+    subgraph Ingest["Ingest Pipeline"]
+        A[Document<br/>PDF / HTML / DOCX / URL] --> B[Parser<br/>text / vision / hybrid]
+        B --> C[Cleaner<br/>header/footer dedupe]
+        C --> D[Anchor-aware<br/>Chunk Packer]
+        D --> E["Metadata Enricher<br/>(optional, LLM)"]
+        E --> F[Embedder<br/>OpenAI / local]
+        D --> G[(BM25 Index)]
+        F --> H[(FAISS Index)]
+    end
+
+    subgraph Query["Query Pipeline"]
+        Q[Question] --> R[BM25 Search]
+        Q --> S[Vector Search]
+        R --> T[RRF Fusion]
+        S --> T
+        T --> U["Reranker<br/>(optional, Voyage / cross-encoder)"]
+        U --> V[Context Packer<br/>token-budgeted]
+        V --> W[LLM Generation]
+        W --> X[Answer + Citations]
+    end
+
+    G -.-> R
+    H -.-> S
+```
+
+Every box on both sides is a swap-in behind a `Base*` interface in
+`rag/core/interfaces/` — e.g. adding a new reranker means implementing
+`BaseReranker.rerank()`, not touching the pipeline that calls it. The same
+`IngestPipeline`/`QueryPipeline` code path is shared by the CLI, the
+Streamlit Studio, and the MCP server (see [Project Structure](#11-project-structure)).
+
+Two design choices worth calling out:
+- **RRF (Reciprocal Rank Fusion)**, not a learned or weighted blend, combines
+  BM25 and vector rankings — no tuning knob to overfit to one eval set.
+- **Reranking is query-time-only.** It never touches what's ingested, which
+  is why the reranker experiment below could reuse an already-built index
+  instead of re-ingesting (see `scripts/asqa_eval.py`).
+
+---
+
+## Results at a glance
+
+Built on [ASQA](https://huggingface.co/datasets/din0s/asqa), a human-labeled
+QA dataset, with a from-scratch corpus/eval harness (`scripts/asqa_eval.py`)
+since ASQA ships questions but not pre-chunked passages. Full methodology,
+caveats, and reproduction commands are in **[EVAL_RESULTS.md](EVAL_RESULTS.md)**.
+
+| Question tested | Finding |
+|---|---|
+| What chunk size? | **512 tokens** is the sweet spot — recall climbs sharply 128→512, then flattens (+0.6pt 512→768) |
+| Does hybrid (BM25+embedding) retrieval help? | **Yes: +6.6pt recall@5** over BM25-only, at 12x query latency |
+| Does a reranker help? | **Yes: +9.2pt recall@5** over BM25-only (VoyageReranker), at 8.5x latency — no ingestion changes needed |
+| Does LLM metadata enrichment help? | **No — a null result.** +0.0pt recall@5 despite real API cost. Reported honestly rather than omitted. |
+| Ingest throughput bottlenecks? | Vision-LLM transcription and embedding calls were both sequential where they should have been parallel — fixed (8.0x simulated / **3.5x live-measured** speedups); batch-mode BM25 rebuild was **O(N²)** — fixed to O(N) (3.2x measured) |
+
+A real production bug was also found and fixed *during* this evaluation work —
+not by a unit test, but by the eval returning 0% recall and forcing a root
+cause — see [Bug found during this study](EVAL_RESULTS.md#bug-found-during-this-study)
+in the full write-up.
+
+---
+
 ## Table of Contents
 
 1. [What You'll Need](#1-what-youll-need)
@@ -21,6 +118,7 @@ A modular, pluggable Retrieval-Augmented Generation (RAG) framework with hybrid 
 11. [Project Structure](#11-project-structure)
 12. [Running Tests](#12-running-tests)
 13. [Troubleshooting](#13-troubleshooting)
+14. [Known Limitations](#known-limitations)
 
 ---
 
@@ -289,6 +387,14 @@ The framework can automatically pull documents from external sources. Configure 
 
 > BEIR SciFact nDCG@10 = 0.703 beats the published ColBERT baseline (0.671).
 
+This table covers the framework's two built-in regression suites
+(`rag.cli.eval`, run via `scripts/beir_eval.py` or the Studio's Evaluation
+Panel). For a deeper, purpose-built evaluation — chunk-size sweep, hybrid
+retrieval, reranking, LLM metadata enrichment, and ingest-throughput
+benchmarks, each with methodology and honest caveats — see
+[Results at a glance](#results-at-a-glance) above and the full
+[EVAL_RESULTS.md](EVAL_RESULTS.md).
+
 ---
 
 ## 11. Project Structure
@@ -317,8 +423,9 @@ rag-framework/
 │       ├── mcp_server/     # MCP tool implementations + schemas
 │       └── cli/            # CLI entry points
 ├── configs/                # YAML settings, prompt templates, profiles
-├── tests/                  # 657 tests (unit + integration + e2e)
-├── scripts/                # BEIR evaluation runner
+├── tests/                  # 1,255 tests (unit + integration + e2e)
+├── scripts/                # asqa_eval.py, beir_eval.py, bench_* throughput benchmarks
+├── EVAL_RESULTS.md         # Full retrieval + ingest-performance study, methodology & caveats
 ├── Dockerfile
 ├── docker-compose.yml
 ├── .env.example
@@ -365,6 +472,45 @@ Chunk IDs are content-based hashes. If you change the parser or chunking setting
 
 **Streamlit shows a blank page**
 Try a hard refresh (`Cmd+Shift+R` on macOS, `Ctrl+Shift+R` on Windows/Linux). If it persists, restart Streamlit.
+
+---
+
+## Known Limitations
+
+Stated plainly rather than left for someone else to discover:
+
+- **Evaluation scope**: the ASQA study (chunk size, hybrid retrieval,
+  reranking, enrichment) samples 150 of 948 dev examples (503 sub-questions)
+  and scores retrieval only, via answer-substring match — not ASQA's
+  official long-form answer-quality metric, and not a full-dataset
+  benchmark. Numbers should be read as directional, not population-precise.
+  See [EVAL_RESULTS.md § Known limitations](EVAL_RESULTS.md#known-limitations-of-this-study)
+  for the complete list, including which throughput benchmarks are live
+  measurements vs. simulated from one real API-latency sample.
+- **`CrossEncoderReranker` is implemented but unbenchmarked** — it depends on
+  `sentence-transformers`, which requires `torch>=2.1`; the shared
+  development environment this project was built in has `torch==2.0.1`.
+  Upgrading torch in an environment not scoped to this project was judged
+  too risky to do unilaterally, so only the API-based `VoyageReranker` has
+  real numbers behind it.
+- **`section_path` (heading breadcrumb) is not populated for PDF-sourced
+  chunks** — it's populated for HTML/Markdown, where heading structure is
+  explicit in the source; PDF text extraction doesn't reliably preserve a
+  heading hierarchy to derive it from.
+- **`TraceStore` persists raw query text in plaintext** with no retention
+  window or redaction policy. Fine for local development; would need
+  addressing before ingesting anything sensitive in a shared deployment.
+- **No "canary" end-to-end test** that makes one real LLM call to catch
+  interface drift against the live OpenAI API — the test suite mocks LLM
+  clients throughout (deliberately, for speed and cost), which is exactly
+  the blind spot that let a real `generate()` call-signature bug ship
+  undetected until the ASQA evaluation surfaced it (see
+  [EVAL_RESULTS.md](EVAL_RESULTS.md)).
+- **Single-machine, single-writer design.** SQLite (DocStore/TraceStore) and
+  the flat-file BM25/FAISS indexes are not built for multi-node deployment —
+  cross-process safety (file locking, see [Architecture](#architecture)) was
+  a deliberate scoping decision for "safe on one machine," not a distributed
+  system.
 
 ---
 
