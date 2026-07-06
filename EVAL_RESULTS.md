@@ -2,11 +2,13 @@
 
 This document reports a retrieval evaluation built on [ASQA](https://huggingface.co/datasets/din0s/asqa)
 (Ambiguous Short-Answer QA, Stelmakh et al. 2022), a human-labeled long-form QA
-dataset. It answers three concrete engineering questions for this project:
+dataset. It answers five concrete engineering questions for this project:
 
 1. **What chunk token budget should the chunker use?**
 2. **Does hybrid (BM25 + embedding) retrieval actually beat BM25 alone, and by how much?**
-3. **What are the ingest-pipeline's throughput and memory bottlenecks, and how much do the fixes help?**
+3. **Does a query-time reranker beat BM25 alone, without changing ingestion at all?**
+4. **Does LLM-generated chunk metadata (title/summary/tags) improve retrieval enough to justify its cost?**
+5. **What are the ingest-pipeline's throughput and memory bottlenecks, and how much do the fixes help?**
 
 Everything below is reproducible with one script (`scripts/asqa_eval.py`) and a
 fixed random seed. Raw per-question results for every run are saved as JSON
@@ -24,6 +26,7 @@ under `data/eval/asqa/*.json` (not tracked in git — see
 | **chunk=512, BM25** | **61.2%** | **68.8%** | 25 ms |
 | chunk=768, BM25 | 61.8% | 69.2% | 20 ms |
 | **chunk=512, BM25 + OpenAI embeddings (hybrid)** | **67.8%** | **74.6%** | 301 ms |
+| **chunk=512, BM25 + VoyageReranker (rerank-2)** | **70.4%** | **72.2%** | 212 ms |
 
 - **512 tokens is the chunk-size sweet spot.** Recall climbs sharply from 128→512
   tokens, then flattens: 512→768 buys only +0.6pt recall@5 for a chunk count that
@@ -33,6 +36,15 @@ under `data/eval/asqa/*.json` (not tracked in git — see
   the same chunk size, at the cost of ~12x query latency (25ms → 301ms — this
   run makes one OpenAI embedding API call per query; latency would drop
   substantially with a local embedding model or query caching).
+- **Reranking BM25's top-20 with a cross-encoder (VoyageReranker, `rerank-2`)
+  adds +9.2pt recall@5 / +3.4pt recall@10** over BM25-only, with no changes to
+  ingestion and no embedding API required, at ~8x query latency (25ms → 212ms).
+  See [Reranking: BM25 + VoyageReranker vs. BM25-only](#reranking-bm25--voyagereranker-vs-bm25-only).
+- **LLM metadata enrichment (title/summary/tags, folded into retrievable text)
+  is a null result on this corpus**: +0.0pt recall@5, +0.4pt recall@10 (noise),
+  for real `gpt-4o-mini` API cost ($0.37 for 350 docs). Wikipedia prose already
+  restates its own topic; a generated title adds little new lexical signal.
+  See [Metadata enrichment: BM25 + LLM title-folding vs. BM25-only](#metadata-enrichment-bm25--llm-title-folding-vs-bm25-only).
 - **A production bug was found and fixed during this study**: BM25-only ingestion
   (`embedding_provider=None`) silently never populated the keyword index. See
   [Bug found during this study](#bug-found-during-this-study).
@@ -182,6 +194,82 @@ mitigated by caching frequent queries, batching, or switching to a
 locally-hosted embedding model (this project also ships a `multilingual`
 local-embedding option — see `rag/infra/embedding/multilingual_embedding.py`)
 — but the raw trade-off is worth stating plainly rather than hiding it.
+
+### Reranking: BM25 + VoyageReranker vs. BM25-only
+
+| Config | Recall@5 | Recall@10 | Query latency |
+|---|---:|---:|---:|
+| BM25-only | 61.2% | 68.8% | 25 ms/query |
+| BM25 (top-20) + VoyageReranker (`rerank-2`) | **70.4%** | **72.2%** | 212 ms/query |
+| **Δ (rerank − BM25)** | **+9.2pt** | **+3.4pt** | 8.5x |
+
+**Reading**: unlike the embedding-hybrid experiment above, this adds *no*
+embedding provider and *no* change to ingestion — it's a pure query-time layer.
+BM25 retrieves its usual top-20 candidates (over-fetched beyond the recall@5/10
+cutoffs specifically so a reranker has room to promote a relevant chunk that
+BM25 ranked outside the top-5 into it — recall@k is a set-membership metric,
+so reordering *within* an already-fixed top-k set cannot move it at all), and
+Voyage's `rerank-2` cross-encoder reorders those 20 by a real query-chunk
+relevance score before the top-5/top-10 are sliced off for scoring.
+
+The recall@5 gain (+9.2pt) is larger than recall@10 (+3.4pt) because
+reranking's whole mechanism is promotion within a fixed candidate pool: a
+chunk BM25 ranked, say, 14th but is highly relevant can be promoted into the
+top-5 by the reranker, which directly helps recall@5; it's already inside
+BM25's top-10, so the same promotion often doesn't change recall@10 at all.
+
+Cost/latency trade-off: 212ms/query (8.5x BM25-only's 25ms) — cheaper in
+latency than the embedding-hybrid config (301ms) despite a *larger* recall@5
+gain, because reranking makes one Voyage API call per query against a small
+(20-candidate) payload rather than one embedding call plus a FAISS search.
+Pricing verified from Voyage's public docs: `rerank-2` gives the first 200M
+tokens/account free, then $0.050 per 1M tokens — for a corpus of this size the
+per-query cost is negligible.
+
+**Setup note**: this run required a Voyage account with a payment method on
+file — the free tier alone is capped at 3 requests/minute, which would take
+~3 hours to score 503 questions. `CrossEncoderReranker` (a local,
+API-free alternative already implemented in this codebase) could not be
+benchmarked in this environment: it depends on `sentence-transformers`, which
+requires `torch>=2.1`, but the shared conda environment used for this project
+has `torch==2.0.1`. Upgrading torch in that shared base environment was
+deliberately avoided rather than done unilaterally — see
+[Known limitations of this study](#known-limitations-of-this-study).
+
+### Metadata enrichment: BM25 + LLM title-folding vs. BM25-only
+
+| Config | Recall@5 | Recall@10 | Ingest cost (350 docs) |
+|---|---:|---:|---:|
+| BM25-only | 61.2% | 68.8% | $0.00 |
+| BM25 + LLM-generated title folded into `stable_text` (`gpt-4o-mini`) | 61.2% | 69.2% | $0.37 |
+| **Δ (enrich − baseline)** | **+0.0pt** | **+0.4pt** | — |
+
+**Reading**: this is a **null result** — within noise on a 503-question
+sample. `LLMBatchMetadataEnricher` generates a title/summary/tags per chunk
+via `gpt-4o-mini` (real API cost, $0.00105/doc average here); with
+`enrich_fold_into_stable_text=True`, the generated title is prefixed onto each
+chunk's retrievable text so it can actually influence BM25 matching (not just
+sit in `chunk.metadata` for display). It didn't move recall in either
+direction beyond noise.
+
+The likely reason: ASQA's corpus is full Wikipedia article sections at a
+512-token chunk budget — already large enough that a chunk's own text
+typically already contains the article's subject and the query's keywords
+directly, since Wikipedia prose is naturally repetitive about its own topic.
+An LLM-generated title mostly restates information the chunk already states
+in its own words, so it adds little new lexical signal for BM25 to match
+against. This might behave differently on a corpus of short, decontextualized
+chunks (e.g. code snippets, log lines, or table rows) where a chunk's
+immediate text genuinely lacks topic context that a generated title could
+supply — untested here.
+
+**Practical implication**: for this project's production use case (the kinds
+of documents actually being ingested — PDFs, uploaded docs — see
+[Known limitations](#known-limitations-of-this-study)), enabling
+`--enrich --enrich-fold` is not shown to justify its LLM cost on retrieval
+grounds alone. The metadata (title/summary/tags) still has standalone value
+for the Studio chunk-browser UI (human skimmability), independent of whether
+it moves recall — that's a separate justification from the one tested here.
 
 ---
 
@@ -417,6 +505,14 @@ prompt. No fix was needed there.
   memory profiler (e.g. `tracemalloc`/`psutil`) reporting actual process RSS
   in MB on a realistic large batch. The two should track together, but only
   the former was measured.
+- **Only one reranker was benchmarked**: `CrossEncoderReranker` (a local,
+  API-free alternative implemented in this codebase) could not be run in this
+  environment — it needs `sentence-transformers`, which needs `torch>=2.1`,
+  but the shared conda base environment installed here has `torch==2.0.1`.
+  Upgrading torch in a shared environment not scoped to this project was
+  judged too risky to do unilaterally, so only the API-based VoyageReranker
+  (`rerank-2`) was measured. Whether a local cross-encoder gives comparable
+  recall gains without Voyage's per-token cost is unverified.
 
 ---
 
@@ -439,6 +535,22 @@ python scripts/asqa_eval.py --n-samples 150 --token-budget 768 \
 # Hybrid retrieval at the selected chunk size (requires OPENAI_API_KEY, ~$0.10-0.20)
 python scripts/asqa_eval.py --n-samples 150 --token-budget 512 --embedding openai \
   --data-dir data/eval/asqa --output data/eval/asqa/pilot_tb512_openai_results.json
+
+# Reranking at the selected chunk size (requires VOYAGE_API_KEY; a payment
+# method on the Voyage account is needed to avoid the 3 RPM free-tier limit.
+# Reranking doesn't change what's ingested, so this reuses the BM25-only
+# tb512 index built by the chunk-size sweep above instead of re-ingesting —
+# do not delete data/eval/asqa/tb512.db / tb512_indexes between runs)
+python scripts/asqa_eval.py --n-samples 150 --token-budget 512 --reranker voyage \
+  --data-dir data/eval/asqa --output data/eval/asqa/pilot_tb512_voyage_rerank_results.json
+
+# Metadata enrichment at the selected chunk size (requires OPENAI_API_KEY,
+# real gpt-4o-mini cost, ~$0.001-0.002/doc / ~$0.37 for the 350-doc corpus).
+# Unlike --reranker, --enrich changes what's ingested (chunk stable_text is
+# rewritten), so this uses its own suffixed db_path/index_dir rather than
+# reusing tb512.
+python scripts/asqa_eval.py --n-samples 150 --token-budget 512 --enrich --enrich-fold \
+  --data-dir data/eval/asqa --output data/eval/asqa/pilot_tb512_enrichfold_results.json
 
 # Batch-ingest speedup benchmark (§ Ingest performance optimizations, free,
 # reuses the cached corpus from the runs above — no network or API key needed)

@@ -204,6 +204,7 @@ def _ingest_corpus(
     embedding: str,
     enrich: bool = False,
     enrich_fold: bool = False,
+    reranker: str = "none",
 ) -> tuple["QueryPipeline", dict]:  # noqa: F821
     """Ingest cached HTML pages into an isolated BM25 (+FAISS) index.
 
@@ -219,6 +220,11 @@ def _ingest_corpus(
             generated title, so the enrichment can actually affect
             BM25/embedding recall (not just chunk-browser display). Only
             meaningful combined with ``enrich=True``.
+        reranker: "none" | "voyage". Reranking is a query-time-only layer
+            over an already-built index — it doesn't change what's
+            ingested, so a --reranker run can (and should) reuse an
+            existing db_path/index_dir from a prior run at the same
+            token_budget/embedding/enrich config rather than re-ingesting.
 
     Returns:
         ``(query_pipeline, ingest_stats)`` — a ready QueryPipeline over the
@@ -257,6 +263,10 @@ def _ingest_corpus(
         vector_index = FaissLocalIndex()
 
     keyword_index = BM25LocalIndex()
+    if (index_dir / "bm25.pkl").exists():
+        keyword_index.load(str(index_dir))
+    if vector_index is not None and (index_dir / "faiss_mapping.pkl").exists():
+        vector_index.load(str(index_dir))
 
     pipeline = IngestPipeline(
         doc_store=doc_store,
@@ -287,12 +297,27 @@ def _ingest_corpus(
 
     print(f"[ingest] Result: {stats}")
 
+    reranker_obj = None
+    if reranker == "voyage":
+        from rag.infra.rerank.voyage_rerank import VoyageReranker
+
+        reranker_obj = VoyageReranker()
+    elif reranker == "crossencoder":
+        from rag.infra.rerank.crossencoder_reranker import CrossEncoderReranker
+
+        reranker_obj = CrossEncoderReranker()
+
     query_pipeline = QueryPipeline(
         keyword_index=keyword_index,
         trace_store=trace_store,
         vector_index=vector_index,
         embedding_provider=embedding_provider,
-        top_k=20,  # over-fetch; we slice to k when scoring recall@5/@10
+        reranker=reranker_obj,
+        top_k=20,  # over-fetch; we slice to k when scoring recall@5/@10 —
+        # this also gives a reranker real room to change which candidates
+        # land in the top-5/top-10 after reordering, not just relabel an
+        # already-fixed top-k set (recall@k is a set-membership metric, so
+        # reordering *within* a fixed top-k set cannot move it at all).
     )
     return query_pipeline, stats
 
@@ -391,6 +416,16 @@ def main() -> None:
         "title, so enrichment can actually move BM25/embedding recall "
         "(not just chunk-browser display). Requires --enrich.",
     )
+    parser.add_argument(
+        "--reranker",
+        choices=["none", "voyage", "crossencoder"],
+        default="none",
+        help="Query-time reranker applied over the top_k=20 candidate pool "
+        "before scoring recall@5/@10. Reranking doesn't change what's "
+        "ingested, so it deliberately does NOT change the db_path/index_dir "
+        "— a --reranker run reuses the same index built by the equivalent "
+        "non-reranker config (ingest becomes a fast no-op skip-pass).",
+    )
     parser.add_argument("--output", type=Path, default=None, help="Save results JSON to this path.")
     args = parser.parse_args()
 
@@ -423,6 +458,7 @@ def main() -> None:
     query_pipeline, ingest_stats = _ingest_corpus(
         pages, db_path, index_dir, args.token_budget, args.embedding,
         enrich=args.enrich, enrich_fold=args.enrich_fold,
+        reranker=args.reranker,
     )
 
     scores = _score(query_pipeline, units, args.top_k)
@@ -430,7 +466,8 @@ def main() -> None:
     print()
     print("=" * 60)
     print(f"ASQA pilot — {scores['n_questions']} questions, "
-          f"token_budget={args.token_budget}, embedding={args.embedding}")
+          f"token_budget={args.token_budget}, embedding={args.embedding}, "
+          f"reranker={args.reranker}")
     print("=" * 60)
     for k, v in scores["recall"].items():
         print(f"  {k:<12} {v * 100:.1f}%")
@@ -449,6 +486,7 @@ def main() -> None:
                 "embedding": args.embedding,
                 "enrich": args.enrich,
                 "enrich_fold": args.enrich_fold,
+                "reranker": args.reranker,
             },
             "ingest_stats": ingest_stats,
             "n_corpus_urls": len(urls),
