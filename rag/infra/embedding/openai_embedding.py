@@ -1,6 +1,7 @@
 """OpenAI embedding provider — wraps the OpenAI Embeddings API."""
 
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
     from openai import OpenAI
@@ -15,6 +16,12 @@ from rag.core.utils.batching import EmbedBatchAccumulator, iter_batches
 from rag.infra.embedding.base_embedding import EmbeddingResult
 
 logger = logging.getLogger(__name__)
+
+# Each embedding batch is one HTTP round-trip, independent of the others, so
+# concurrent requests parallelize well (same reasoning as Vision page
+# transcription — see PdfVisionParser.parse_pages_parallel). 4 is a
+# conservative default that stays well under typical per-org rate limits.
+_DEFAULT_MAX_WORKERS = 4
 
 
 class OpenAIEmbeddingProvider(BaseEmbeddingProvider):
@@ -34,6 +41,9 @@ class OpenAIEmbeddingProvider(BaseEmbeddingProvider):
         api_key: OpenAI API key. If None, the ``OPENAI_API_KEY`` environment
             variable is used (standard OpenAI client behaviour).
         batch_size: Maximum number of texts per API call. Defaults to 64.
+        max_workers: Maximum concurrent batch-embedding requests. Batches are
+            network-bound (one HTTP round-trip each), so multiple batches are
+            sent concurrently via a thread pool. Defaults to 4.
     """
 
     def __init__(
@@ -42,6 +52,7 @@ class OpenAIEmbeddingProvider(BaseEmbeddingProvider):
         dim: int = 1536,
         api_key: str | None = None,
         batch_size: int = 64,
+        max_workers: int = _DEFAULT_MAX_WORKERS,
         **kwargs,
     ) -> None:
         if OpenAI is None:
@@ -53,6 +64,7 @@ class OpenAIEmbeddingProvider(BaseEmbeddingProvider):
         self._model = model
         self._dim = dim
         self._batch_size = batch_size
+        self._max_workers = max_workers
         self._client = OpenAI(api_key=api_key) if api_key else OpenAI()
 
     @property
@@ -80,17 +92,49 @@ class OpenAIEmbeddingProvider(BaseEmbeddingProvider):
         """
         return self.embed_with_usage(texts).vectors
 
+    def _embed_batch(self, batch: list[str]) -> tuple[list[list[float]], int]:
+        """Embed one batch via a single API call.
+
+        Args:
+            batch: Texts for this batch (at most ``batch_size``).
+
+        Returns:
+            ``(vectors, prompt_tokens)`` for this batch, vectors in input order.
+        """
+        try:
+            response = self._client.embeddings.create(
+                model=self._model,
+                input=batch,
+            )
+        except Exception as exc:
+            logger.error("OpenAI embeddings API call failed: %s", exc)
+            raise
+
+        # Response items carry an index field — sort to guarantee order.
+        sorted_data = sorted(response.data, key=lambda item: item.index)
+        batch_vectors = [item.embedding for item in sorted_data]
+
+        logger.debug(
+            "Embedded %d text(s), tokens used: %d",
+            len(batch),
+            response.usage.prompt_tokens,
+        )
+        return batch_vectors, response.usage.prompt_tokens
+
     def embed_with_usage(self, texts: list[str]) -> EmbeddingResult:
         """Embed texts and return vectors plus aggregated token usage.
 
-        Splits ``texts`` into batches of ``batch_size``, calls the API for
-        each batch, and aggregates vectors and token counts.
+        Splits ``texts`` into batches of ``batch_size`` and sends them
+        concurrently via a thread pool — each batch is an independent HTTP
+        round-trip, so this is network-bound rather than CPU-bound (same
+        reasoning as ``PdfVisionParser.parse_pages_parallel``).
 
         Args:
             texts: Non-empty list of text strings to embed.
 
         Returns:
             EmbeddingResult with vectors, model name, and total prompt tokens.
+            Vectors are in the same order as the input ``texts``.
 
         Raises:
             ValueError: If ``texts`` is empty.
@@ -99,28 +143,21 @@ class OpenAIEmbeddingProvider(BaseEmbeddingProvider):
         if not texts:
             raise ValueError("texts must not be empty")
 
+        batches = list(iter_batches(texts, self._batch_size))
+        results: list[tuple[list[list[float]], int]] = [None] * len(batches)  # type: ignore[list-item]
+
+        workers = max(1, min(self._max_workers, len(batches)))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_to_index = {
+                executor.submit(self._embed_batch, batch): i
+                for i, batch in enumerate(batches)
+            }
+            for future in as_completed(future_to_index):
+                results[future_to_index[future]] = future.result()
+
         acc = EmbedBatchAccumulator()
-
-        for batch in iter_batches(texts, self._batch_size):
-            try:
-                response = self._client.embeddings.create(
-                    model=self._model,
-                    input=batch,
-                )
-            except Exception as exc:
-                logger.error("OpenAI embeddings API call failed: %s", exc)
-                raise
-
-            # Response items carry an index field — sort to guarantee order.
-            sorted_data = sorted(response.data, key=lambda item: item.index)
-            batch_vectors = [item.embedding for item in sorted_data]
-            acc.add(batch_vectors, response.usage.prompt_tokens)
-
-            logger.debug(
-                "Embedded %d text(s), tokens used: %d",
-                len(batch),
-                response.usage.prompt_tokens,
-            )
+        for batch_vectors, prompt_tokens in results:
+            acc.add(batch_vectors, prompt_tokens)
 
         return EmbeddingResult(
             vectors=acc.vectors,

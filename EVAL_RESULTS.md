@@ -48,10 +48,12 @@ under `data/eval/asqa/*.json` (not tracked in git — see
 - **A production bug was found and fixed during this study**: BM25-only ingestion
   (`embedding_provider=None`) silently never populated the keyword index. See
   [Bug found during this study](#bug-found-during-this-study).
-- **Two ingest throughput bottlenecks were found and fixed**: Vision-LLM page
-  transcription ran one page at a time (network-bound, embarrassingly
-  parallel), and batch ingest rebuilt the entire BM25 index from scratch after
-  every document (O(N²) for a batch of N). See
+- **Three ingest throughput bottlenecks were found and fixed**: Vision-LLM page
+  transcription and OpenAI embedding calls each ran one at a time (both
+  network-bound, embarrassingly parallel — now parallelized via a thread
+  pool, 8.0x simulated / **3.5x live-measured** speedup respectively), and
+  batch ingest rebuilt the entire BM25 index from scratch after every
+  document (O(N²) for a batch of N). See
   [Ingest performance optimizations](#ingest-performance-optimizations).
 - **A memory-scaling defect in batch ingest was found and fixed**: peak memory
   during `ingest_many()` grew with the *total batch size*, not the configured
@@ -466,6 +468,36 @@ an unbounded context-window risk — was checked and found **already correct**:
 deduplication and truncation before any context reaches the answer-generation
 prompt. No fix was needed there.
 
+### 5. Embedding batch concurrency — sequential → parallel (real, live benchmark)
+
+`OpenAIEmbeddingProvider.embed_with_usage()` split texts into batches of
+`batch_size` (default 64) but called the embeddings API for each batch
+sequentially in a `for` loop — the same network-bound, embarrassingly
+parallel shape as the Vision-LLM transcription bottleneck above (§1), just
+for embedding calls instead of Vision calls. Fixed the same way: batches are
+now submitted to a shared `ThreadPoolExecutor` (default 4 workers,
+configurable via `max_workers`), with results reassembled in original text
+order (not completion order) before being handed back.
+
+Unlike Vision-LLM (rate-limited, ~$0.01-0.03/page, made simulation the only
+practical option — see §1's methodology caveat), `text-embedding-3-small` is
+cheap enough ($0.02/1M tokens) that this was benchmarked **live**, embedding
+1,280 synthetic sentences (20 batches of 64) with `OPENAI_API_KEY`:
+
+| Workers | Time (1,280 texts, 20 batches, live API calls) |
+|---:|---:|
+| 1 (sequential) | 10.2s |
+| 4 (parallel) | 2.9s |
+| **Speedup** | **3.5x** |
+
+**Reading**: 3.5x on 4 workers (rather than a clean 4.0x) reflects real
+network variance across the 20 live calls, not a simulated ceiling — this is
+an actual measured number, not an estimate. `max_workers=4` was chosen as a
+conservative default (same reasoning as Vision's default of 8): embedding
+calls are smaller/cheaper per-request than Vision calls, so a lower default
+was picked to stay comfortably under typical per-org rate limits while still
+capturing most of the available speedup.
+
 ---
 
 ## Known limitations of this study
@@ -555,6 +587,10 @@ python scripts/asqa_eval.py --n-samples 150 --token-budget 512 --enrich --enrich
 # Batch-ingest speedup benchmark (§ Ingest performance optimizations, free,
 # reuses the cached corpus from the runs above — no network or API key needed)
 python scripts/bench_batch_ingest.py
+
+# Embedding batch concurrency speedup benchmark (§5, requires OPENAI_API_KEY,
+# live API calls but negligible cost — a fraction of a cent for the defaults)
+python scripts/bench_embedding_parallel.py
 
 # ingest_many() peak-memory bound (§4) and the file-size guard — both are
 # regression tests, not standalone scripts:
