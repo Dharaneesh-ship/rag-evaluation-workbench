@@ -311,9 +311,18 @@ docker-compose up --build
 
 This starts two services:
 - **Studio UI** → http://localhost:8501
-- **MCP Server** → http://localhost:8000
+- **MCP Server** → runs inside its own container, but see the caveat below
 
 Your data (database + indexes) is stored in a Docker volume so it persists across restarts.
+
+> ⚠️ **Known gap**: the `mcp` service maps port 8000, but the server uses
+> **stdio transport** (see [§8](#8-mcp-server-claude-integration)), which has
+> no HTTP listener — that port mapping currently does nothing. A stdio-based
+> MCP server is meant to be spawned directly by its client as a subprocess,
+> not run as a standalone container a remote client connects to. For actual
+> MCP client integration (Claude Desktop, Claude Code, etc.), run the server
+> locally per §8's instructions rather than via Docker, until this service is
+> updated to use `transport="streamable-http"`.
 
 ### Stop
 
@@ -347,11 +356,41 @@ The MCP server exposes the RAG pipeline as tools that Claude (or any MCP-compati
 
 ### Starting the MCP server
 
-```bash
-python -m rag.app.mcp_server.server
+The server uses **stdio transport** (the MCP default) — it isn't a
+long-running HTTP service you start and then `curl`. An MCP client (Claude
+Desktop, Claude Code, Cursor, etc.) launches it as a subprocess and talks to
+it over stdin/stdout. Point your client at it with a config entry like:
+
+```json
+{
+  "mcpServers": {
+    "rag-framework": {
+      "command": "/absolute/path/to/venv/bin/python",
+      "args": ["-m", "rag.app.mcp_server.server"],
+      "cwd": "/absolute/path/to/rag-framework"
+    }
+  }
+}
 ```
 
-The server runs on `http://localhost:8000`.
+`command` must be the exact Python interpreter with this project's
+dependencies installed, and `cwd` must be the repo root — the server's
+default `index_dir="data/indexes"` is a relative path, so a wrong working
+directory silently creates/reads the wrong data folder. Where this config
+goes depends on your client (e.g. Claude Desktop's `claude_desktop_config.json`,
+Claude Code's `.mcp.json` or `claude mcp add`) — check its docs for "MCP
+server config."
+
+To sanity-check the server on its own (without a client), you can list its
+registered tools directly:
+
+```bash
+python -c "
+import asyncio
+from rag.app.mcp_server.server import mcp
+print([t.name for t in asyncio.run(mcp.list_tools())])
+"
+```
 
 ### Using collection scoping
 
