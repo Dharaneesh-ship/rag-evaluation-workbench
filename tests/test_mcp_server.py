@@ -315,3 +315,67 @@ def test_build_query_pipeline_returns_query_pipeline():
             )
         from rag.pipelines.query_pipeline import QueryPipeline
         assert isinstance(pipeline, QueryPipeline)
+
+
+# ---------------------------------------------------------------------------
+# Transport configuration (MCP_HOST/MCP_PORT/MCP_TRANSPORT env vars)
+# ---------------------------------------------------------------------------
+
+
+class TestTransportConfigFromEnv:
+    """docker-compose.yml relies on MCP_HOST=0.0.0.0 and
+    MCP_TRANSPORT=streamable-http actually reaching FastMCP — a container's
+    published port is silently dead if these aren't wired through.
+
+    Tests patch mcp.server.fastmcp.FastMCP (the source attribute), not
+    server.py's already-bound name — importlib.reload re-executes `from
+    mcp.server.fastmcp import FastMCP`, which would silently rebind over a
+    patch applied to rag.app.mcp_server.server.FastMCP mid-reload.
+    """
+
+    def _reload_server_module(self):
+        import importlib
+        import rag.app.mcp_server.server as server_module
+        return importlib.reload(server_module)
+
+    def test_host_and_port_read_from_env(self, monkeypatch):
+        monkeypatch.setenv("MCP_HOST", "0.0.0.0")
+        monkeypatch.setenv("MCP_PORT", "9999")
+        with patch("mcp.server.fastmcp.FastMCP") as MockFastMCP:
+            MockFastMCP.return_value = MagicMock()
+            self._reload_server_module()
+            _, kwargs = MockFastMCP.call_args
+            assert kwargs["host"] == "0.0.0.0"
+            assert kwargs["port"] == 9999
+        self._reload_server_module()  # restore real FastMCP for later tests
+
+    def test_defaults_to_loopback_when_env_unset(self, monkeypatch):
+        monkeypatch.delenv("MCP_HOST", raising=False)
+        monkeypatch.delenv("MCP_PORT", raising=False)
+        with patch("mcp.server.fastmcp.FastMCP") as MockFastMCP:
+            MockFastMCP.return_value = MagicMock()
+            self._reload_server_module()
+            _, kwargs = MockFastMCP.call_args
+            assert kwargs["host"] == "127.0.0.1"
+            assert kwargs["port"] == 8000
+        self._reload_server_module()
+
+    def test_run_uses_transport_from_env(self, monkeypatch):
+        monkeypatch.setenv("MCP_TRANSPORT", "streamable-http")
+        server_module = self._reload_server_module()
+        with (
+            patch.object(server_module, "_harden_stdio"),
+            patch.object(server_module.mcp, "run") as mock_run,
+        ):
+            server_module._run()
+            mock_run.assert_called_once_with(transport="streamable-http")
+
+    def test_run_defaults_to_stdio_when_env_unset(self, monkeypatch):
+        monkeypatch.delenv("MCP_TRANSPORT", raising=False)
+        server_module = self._reload_server_module()
+        with (
+            patch.object(server_module, "_harden_stdio"),
+            patch.object(server_module.mcp, "run") as mock_run,
+        ):
+            server_module._run()
+            mock_run.assert_called_once_with(transport="stdio")

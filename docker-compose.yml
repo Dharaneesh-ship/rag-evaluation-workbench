@@ -44,6 +44,13 @@ services:
     environment:
       RAG_DATA_DIR: /app/data
       KMP_DUPLICATE_LIB_OK: "TRUE"
+      # A detached container has no client attached to its stdin/stdout, so
+      # the stdio transport (this server's default for local/subprocess use
+      # — see README §8) doesn't apply here. streamable-http gives it an
+      # actual HTTP listener, and MCP_HOST must be 0.0.0.0 (not the
+      # loopback-only default) for the published port below to reach it.
+      MCP_TRANSPORT: streamable-http
+      MCP_HOST: 0.0.0.0
     restart: unless-stopped
     depends_on:
       studio:

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import builtins
 import logging
+import os
 import sys
 
 from mcp.server.fastmcp import FastMCP
@@ -47,6 +48,12 @@ mcp = FastMCP(
         "RAG Framework MCP server. Provides tools for document ingestion, "
         "grounded question answering, and retrieval evaluation."
     ),
+    # host/port only matter for the "sse"/"streamable-http" transports below —
+    # ignored entirely under the default "stdio" transport. MCP_HOST defaults
+    # to loopback-only; set to 0.0.0.0 (as docker-compose.yml does) so the
+    # container's published port is actually reachable from outside it.
+    host=os.environ.get("MCP_HOST", "127.0.0.1"),
+    port=int(os.environ.get("MCP_PORT", "8000")),
 )
 
 
@@ -603,6 +610,17 @@ def _harden_stdio() -> None:
 # Entry point for running as a standalone MCP server
 # ---------------------------------------------------------------------------
 
-if __name__ == "__main__":
+def _run() -> None:
+    """Start the server with the transport named by MCP_TRANSPORT.
+
+    Defaults to stdio (the right choice when an MCP client spawns this as a
+    subprocess — see README §8). docker-compose.yml sets
+    MCP_TRANSPORT=streamable-http, since a detached container has no client
+    attached to its stdin/stdout to talk to.
+    """
     _harden_stdio()
-    mcp.run()
+    mcp.run(transport=os.environ.get("MCP_TRANSPORT", "stdio"))
+
+
+if __name__ == "__main__":
+    _run()

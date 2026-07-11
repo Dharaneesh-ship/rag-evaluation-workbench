@@ -311,18 +311,20 @@ docker-compose up --build
 
 This starts two services:
 - **Studio UI** → http://localhost:8501
-- **MCP Server** → runs inside its own container, but see the caveat below
+- **MCP Server** → http://localhost:8000/mcp (HTTP, only inside Docker — see below)
 
 Your data (database + indexes) is stored in a Docker volume so it persists across restarts.
 
-> ⚠️ **Known gap**: the `mcp` service maps port 8000, but the server uses
-> **stdio transport** (see [§8](#8-mcp-server-claude-integration)), which has
-> no HTTP listener — that port mapping currently does nothing. A stdio-based
-> MCP server is meant to be spawned directly by its client as a subprocess,
-> not run as a standalone container a remote client connects to. For actual
-> MCP client integration (Claude Desktop, Claude Code, etc.), run the server
-> locally per §8's instructions rather than via Docker, until this service is
-> updated to use `transport="streamable-http"`.
+> **Note on the MCP server's two modes**: the server defaults to **stdio**
+> transport, meant for an MCP client (Claude Desktop, Claude Code, etc.) to
+> spawn as a local subprocess — see [§8](#8-mcp-server-claude-integration) for
+> that setup. A detached Docker container has no client attached to its
+> stdin/stdout, so `docker-compose.yml` instead sets `MCP_TRANSPORT=streamable-http`
+> and `MCP_HOST=0.0.0.0`, giving the containerized server an actual HTTP
+> endpoint at `http://localhost:8000/mcp`. If your MCP client supports
+> connecting to a remote HTTP server (rather than spawning a subprocess),
+> point it at that URL instead of using the `command`/`args`/`cwd` config
+> from §8.
 
 ### Stop
 
