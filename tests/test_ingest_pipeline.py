@@ -282,3 +282,86 @@ def test_ingest_faiss_searchable_after_save_reload(sample_txt, tmp_path):
     query = [0.0] * _DIM
     candidates = faiss_idx2.search(query, top_k=5)
     assert len(candidates) > 0
+
+
+# ---------------------------------------------------------------------------
+# Collection tagging / isolation
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def sample_txt_other(tmp_path: Path) -> str:
+    p = tmp_path / "sample_other.txt"
+    p.write_text(
+        "First paragraph about zebras.\n\n"
+        "Second paragraph about zebras.\n\n"
+        "Third paragraph about zebras.\n",
+        encoding="utf-8",
+    )
+    return str(p)
+
+
+def test_ingest_with_collection_stamps_chunk_metadata(sample_txt, tmp_path):
+    db = str(tmp_path / "rag.db")
+    doc_store, trace_store = _make_stores(db)
+    pipeline = IngestPipeline(doc_store, trace_store)
+    result = pipeline.ingest(sample_txt, collection="wake_apparel")
+    chunks = doc_store.get_chunks(result.doc_id)
+    assert chunks
+    assert all(c.metadata.get("collection") == "wake_apparel" for c in chunks)
+
+
+def test_ingest_without_collection_leaves_chunk_metadata_unset(sample_txt, tmp_path):
+    db = str(tmp_path / "rag.db")
+    doc_store, trace_store = _make_stores(db)
+    pipeline = IngestPipeline(doc_store, trace_store)
+    result = pipeline.ingest(sample_txt)
+    chunks = doc_store.get_chunks(result.doc_id)
+    assert chunks
+    assert all("collection" not in c.metadata for c in chunks)
+
+
+def test_ingest_with_collection_stamps_document_metadata(sample_txt, tmp_path):
+    db = str(tmp_path / "rag.db")
+    doc_store, trace_store = _make_stores(db)
+    pipeline = IngestPipeline(doc_store, trace_store)
+    result = pipeline.ingest(sample_txt, collection="wake_apparel")
+    doc = doc_store.get_document(result.doc_id)
+    assert doc.metadata.get("collection") == "wake_apparel"
+
+
+def test_list_documents_reports_collection(sample_txt, sample_txt_other, tmp_path):
+    db = str(tmp_path / "rag.db")
+    doc_store, trace_store = _make_stores(db)
+    pipeline = IngestPipeline(doc_store, trace_store)
+    r1 = pipeline.ingest(sample_txt, collection="wake_apparel")
+    r2 = pipeline.ingest(sample_txt_other)
+
+    docs = {d["doc_id"]: d for d in doc_store.list_documents()}
+    assert docs[r1.doc_id]["collection"] == "wake_apparel"
+    assert docs[r2.doc_id]["collection"] is None
+
+
+def test_bm25_search_scoped_to_collection_excludes_other_collections(
+    sample_txt, sample_txt_other, tmp_path
+):
+    """End-to-end: a collection-scoped query must not surface chunks from an
+    unrelated document ingested without that collection tag — this is the
+    isolation guarantee the 'collection' field exists to provide."""
+    db = str(tmp_path / "rag.db")
+    doc_store, trace_store = _make_stores(db)
+    bm25_idx = BM25LocalIndex()
+    pipeline = IngestPipeline(doc_store, trace_store, keyword_index=bm25_idx)
+
+    r1 = pipeline.ingest(sample_txt, collection="wake_apparel")
+    r2 = pipeline.ingest(sample_txt_other)  # unrelated doc, no collection tag
+
+    # Unscoped search sees both documents' chunks.
+    unscoped = bm25_idx.search("paragraph", top_k=10)
+    assert len(unscoped) == r1.chunk_count + r2.chunk_count
+
+    # Scoped search only sees the tagged document's chunks.
+    scoped = bm25_idx.search("paragraph", top_k=10, collection="wake_apparel")
+    assert len(scoped) == r1.chunk_count
+    assert all(c.metadata.get("collection") == "wake_apparel" for c in scoped)
+    assert all(c.doc_id == r1.doc_id for c in scoped)

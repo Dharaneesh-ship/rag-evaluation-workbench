@@ -101,6 +101,19 @@ class TestDocumentCRUD:
         retrieved = store.get_document("doc-001")
         assert retrieved.source_path == "/tmp/updated.pdf"
 
+    def test_list_documents_exposes_collection_from_metadata(self, store, sample_doc):
+        store.save_document(sample_doc)  # metadata has no "collection" key
+        tagged = Document(
+            doc_id="doc-002",
+            source_path="/tmp/tagged.pdf",
+            metadata={"collection": "wake_apparel"},
+        )
+        store.save_document(tagged)
+
+        docs = {d["doc_id"]: d for d in store.list_documents()}
+        assert docs["doc-001"]["collection"] is None
+        assert docs["doc-002"]["collection"] == "wake_apparel"
+
 
 @pytest.mark.integration
 class TestTextBlockCRUD:

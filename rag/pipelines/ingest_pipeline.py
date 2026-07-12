@@ -589,6 +589,7 @@ class IngestPipeline:
         self,
         source_path: str | Path,
         canonical_name: str | None = None,
+        collection: str | None = None,
     ) -> IngestResult:
         """Ingest a single document file end-to-end.
 
@@ -599,6 +600,12 @@ class IngestPipeline:
                 Pass the original filename when ingesting from a temp file
                 (e.g. Streamlit uploads) so re-ingesting the same document
                 correctly removes the previous version's chunks.
+            collection: Optional collection name stamped onto the document
+                and every chunk's metadata (``metadata["collection"]``).
+                Retrieval can then scope BM25/FAISS search to chunks from
+                this collection only (see ``QueryPipeline.query``). Left
+                unstamped (``None``) when omitted — such chunks are only
+                reachable by an unscoped (collection=None) query.
 
         Returns:
             IngestResult summarising the outcome.
@@ -616,7 +623,9 @@ class IngestPipeline:
         )
 
         try:
-            result = self._run(source_path, run_id, canonical_name=canonical)
+            result = self._run(
+                source_path, run_id, canonical_name=canonical, collection=collection
+            )
         except Exception as exc:
             logger.exception("Ingest failed for '%s': %s", canonical, exc)
             result = IngestResult(
@@ -651,6 +660,7 @@ class IngestPipeline:
         paths: list[str | Path],
         canonical_names: Optional[list[Optional[str]]] = None,
         max_workers: int = 1,
+        collection: str | None = None,
     ) -> list[IngestResult]:
         """Ingest many files, parsing/cleaning/chunking concurrently.
 
@@ -678,6 +688,8 @@ class IngestPipeline:
             max_workers: Number of concurrent prepare-phase threads.
                 ``1`` runs fully sequentially (no thread pool overhead) and
                 is equivalent to calling ``ingest()`` in a loop.
+            collection: Optional collection name applied to every document in
+                this batch (same meaning as ``ingest()``'s ``collection``).
 
         Returns:
             One IngestResult per path, in the same order as ``paths``.
@@ -716,7 +728,7 @@ class IngestPipeline:
                 result = prepared
             else:
                 try:
-                    result = self._commit(prepared, run_id)
+                    result = self._commit(prepared, run_id, collection=collection)
                 except Exception as exc:
                     logger.exception("Ingest commit failed for '%s': %s", canonical, exc)
                     result = IngestResult(
@@ -797,6 +809,7 @@ class IngestPipeline:
         source_path: str,
         run_id: str,
         canonical_name: str | None = None,
+        collection: str | None = None,
     ) -> IngestResult:
         """Internal pipeline execution — all stages, single-threaded.
 
@@ -811,6 +824,7 @@ class IngestPipeline:
             source_path: Resolved absolute path to the source file to read.
             run_id: TraceStore run identifier.
             canonical_name: Stable key for DocStore lookups (default: source_path).
+            collection: Optional collection name (see ``ingest()``).
 
         Returns:
             Populated IngestResult on success.
@@ -821,7 +835,7 @@ class IngestPipeline:
         prepared = self._prepare(source_path, run_id, canonical_name=canonical_name)
         if isinstance(prepared, IngestResult):
             return prepared
-        return self._commit(prepared, run_id)
+        return self._commit(prepared, run_id, collection=collection)
 
     def _prepare(
         self,
@@ -1072,7 +1086,9 @@ class IngestPipeline:
             cost_usd=cost_usd,
         )
 
-    def _commit(self, prepared: "_Prepared", run_id: str) -> IngestResult:
+    def _commit(
+        self, prepared: "_Prepared", run_id: str, collection: str | None = None
+    ) -> IngestResult:
         """DocStore writes and index updates for a prepared document.
 
         Must be called from a single thread only — this is where the
@@ -1083,6 +1099,11 @@ class IngestPipeline:
         Args:
             prepared: Output of ``_prepare()`` for one document.
             run_id: TraceStore run identifier for this document.
+            collection: Optional collection name (see ``ingest()``). Stamped
+                onto the document and every chunk's metadata here, right
+                before they're persisted/indexed — this is the single place
+                both the DocStore write and the keyword/vector index add
+                originate from, so one stamp covers both.
 
         Returns:
             Populated IngestResult.
@@ -1099,6 +1120,11 @@ class IngestPipeline:
         prev_chunk_ids = prepared.prev_chunk_ids
         block_diff = prepared.block_diff
         timings = dict(prepared.stage_timings_ms)
+
+        if collection:
+            document.metadata["collection"] = collection
+            for chunk in chunks:
+                chunk.metadata["collection"] = collection
 
         # 5. Store document
         t0 = time.monotonic()

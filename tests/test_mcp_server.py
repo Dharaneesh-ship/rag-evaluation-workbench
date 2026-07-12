@@ -122,6 +122,25 @@ def test_rag_ingest_skipped_flag_forwarded(tmp_path):
     assert result.skipped is True
 
 
+def test_rag_ingest_forwards_collection_to_pipeline(tmp_path):
+    """IngestToolInput.collection must reach pipeline.ingest() — previously
+    it was validated by the schema but silently dropped before the actual
+    ingest call, so no chunk was ever tagged with a collection."""
+    inp = IngestToolInput(
+        source_path="/tmp/doc.txt",
+        index_dir=str(tmp_path / "indexes"),
+        collection="wake_apparel",
+    )
+    with patch("rag.app.mcp_server.server.build_ingest_pipeline") as mock_build:
+        mock_pipeline = MagicMock()
+        mock_pipeline.ingest.return_value = _make_ingest_result()
+        mock_build.return_value = (mock_pipeline, MagicMock())
+        rag_ingest(inp)
+    mock_pipeline.ingest.assert_called_once_with(
+        "/tmp/doc.txt", collection="wake_apparel"
+    )
+
+
 # ---------------------------------------------------------------------------
 # rag.query tool
 # ---------------------------------------------------------------------------
@@ -195,6 +214,18 @@ def test_rag_query_candidate_count():
         mock_build.return_value.query.return_value = _make_query_result(candidates=fake_cands)
         result = rag_query(inp)
     assert result.candidate_count == 3
+
+
+def test_rag_query_forwards_collection_to_pipeline():
+    """QueryToolInput.collection must reach pipeline.query() — previously
+    it was validated by the schema but silently dropped before the actual
+    query call, making the collection filter a no-op for this tool."""
+    inp = QueryToolInput(query="Q?", enable_generation=False, collection="wake_apparel")
+    with patch("rag.app.mcp_server.server.build_query_pipeline") as mock_build:
+        mock_pipeline = mock_build.return_value
+        mock_pipeline.query.return_value = _make_query_result()
+        rag_query(inp)
+    mock_pipeline.query.assert_called_once_with("Q?", collection="wake_apparel")
 
 
 # ---------------------------------------------------------------------------

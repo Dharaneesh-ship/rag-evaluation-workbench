@@ -425,14 +425,23 @@ class SQLiteDocStore(BaseDocStore):
         """Return a summary list of all ingested documents.
 
         Returns:
-            List of dicts with keys: doc_id, source_path, mime_type.
+            List of dicts with keys: doc_id, source_path, mime_type,
+            collection (from metadata_json, or None if never set).
             Ordered by rowid descending (most recently ingested first).
         """
         with self._conn() as conn:
             rows = conn.execute(
-                "SELECT doc_id, source_path, mime_type FROM documents ORDER BY rowid DESC"
+                "SELECT doc_id, source_path, mime_type, metadata_json FROM documents ORDER BY rowid DESC"
             ).fetchall()
-        return [{"doc_id": r["doc_id"], "source_path": r["source_path"], "mime_type": r["mime_type"]} for r in rows]
+        return [
+            {
+                "doc_id": r["doc_id"],
+                "source_path": r["source_path"],
+                "mime_type": r["mime_type"],
+                "collection": json.loads(r["metadata_json"]).get("collection"),
+            }
+            for r in rows
+        ]
 
     def get_all_chunks(self, doc_id: str | None = None) -> list[Chunk]:
         """Retrieve chunks, optionally filtered to a single document.

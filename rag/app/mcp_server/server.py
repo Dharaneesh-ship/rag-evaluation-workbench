@@ -97,7 +97,7 @@ def rag_ingest(input: IngestToolInput) -> IngestToolOutput:
                 vector_dimension=input.vector_dimension,
                 index_mgr=index_mgr,
             )
-            result = pipeline.ingest(input.source_path)
+            result = pipeline.ingest(input.source_path, collection=input.collection)
 
         return IngestToolOutput(
             doc_id=result.doc_id,
@@ -158,7 +158,7 @@ def rag_query(input: QueryToolInput) -> QueryToolOutput:
             llm_model=input.llm_model,
             enable_generation=input.enable_generation,
         )
-        result = pipeline.query(input.query)
+        result = pipeline.query(input.query, collection=input.collection)
 
         # Extract answer fields
         answer_text = ""
