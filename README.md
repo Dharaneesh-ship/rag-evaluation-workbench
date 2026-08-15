@@ -493,6 +493,16 @@ actually ran: `retrieval_mode` (`"bm25_only"` / `"hybrid"` /
   (`RERANKER_UNAVAILABLE`), never a silent "skip reranking and continue" —
   `RAG_INDEX_COMPAT_MODE=degraded` only governs the embedding/vector-index
   compatibility check, not reranker availability.
+- **`faiss`, `torch` (via `sentence-transformers`), and `voyageai` each
+  statically link their own copy of OpenMP.** Loading two of them in the
+  same process in the wrong order raises `OMP: Error #15` and **aborts the
+  whole process**, not just the current call — a real crash caught during
+  ecosystem integration testing (`ECOSYSTEM_INTEGRATION_PLAN.md` 附录 M.4).
+  `rag/__init__.py` sets `KMP_DUPLICATE_LIB_OK=TRUE` before any submodule
+  can import those packages, so this is handled automatically for every
+  entry point (MCP server, CLI, Studio) — you don't need to set it
+  yourself, but you can override it (e.g. to `FALSE`) if you specifically
+  want the crash to surface instead of being suppressed.
 
 ---
 
