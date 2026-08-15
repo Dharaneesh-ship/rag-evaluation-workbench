@@ -3,9 +3,28 @@ retrieve, retrieve_with_metadata, list_collections."""
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator, model_validator
+
+# ---------------------------------------------------------------------------
+# Shared retrieval config enums (定案 #7)
+#
+# provider and model are independent knobs: "server_default" defers to the
+# service's configured default (see rag.app.mcp_server.retrieval_config),
+# "none" explicitly disables that stage, and any other literal is an
+# explicit request that overrides the server default. Old clients that omit
+# the field, or send an explicit ``null``, are normalized to
+# "server_default" below rather than rejected.
+# ---------------------------------------------------------------------------
+
+EmbeddingProviderEnum = Literal["server_default", "none", "openai"]
+RerankerProviderEnum = Literal["server_default", "none", "crossencoder", "voyage"]
+
+
+def _server_default_if_none(v: Any) -> Any:
+    """Normalize an explicit ``null``/omitted enum value to ``"server_default"``."""
+    return v if v is not None else "server_default"
 
 
 # ---------------------------------------------------------------------------
@@ -20,8 +39,9 @@ class IngestToolInput(BaseModel):
         source_path: Absolute or relative path to the file to ingest.
         collection: Target collection name. Defaults to ``"default"``.
         token_budget: Maximum tokens per chunk. Defaults to 512.
-        embedding_provider: Embedding provider key, e.g. ``"openai"``.
-            If None, embedding is skipped.
+        embedding_provider: ``"server_default"`` (use the service's
+            configured default), ``"none"`` (BM25 only), or an explicit
+            provider key (e.g. ``"openai"``). Defaults to ``"server_default"``.
         embedding_model: Model identifier for the embedding provider.
         vector_dimension: Expected vector dimensionality.
         db_path: Path to the SQLite database file.
@@ -31,11 +51,15 @@ class IngestToolInput(BaseModel):
     source_path: str = Field(..., min_length=1, description="Path to the file to ingest")
     collection: str = Field(default="default", min_length=1)
     token_budget: int = Field(default=512, ge=64, le=4096)
-    embedding_provider: Optional[str] = Field(default=None)
+    embedding_provider: EmbeddingProviderEnum = Field(default="server_default")
     embedding_model: str = Field(default="text-embedding-3-small")
     vector_dimension: int = Field(default=1536, ge=1, le=8192)
     db_path: str = Field(default="data/rag.db")
     index_dir: str = Field(default="data/indexes")
+
+    _normalize_embedding_provider = field_validator("embedding_provider", mode="before")(
+        _server_default_if_none
+    )
 
     @field_validator("source_path")
     @classmethod
@@ -85,9 +109,15 @@ class QueryToolInput(BaseModel):
         context_top_k: Chunks to pack into the LLM context window. Defaults to 6.
         token_budget: Token budget for context packing. Defaults to 2048.
         collection: Collection to query against. Defaults to ``"default"``.
-        embedding_provider: Embedding provider key, or None to skip vector search.
+        embedding_provider: ``"server_default"``, ``"none"``, or an explicit
+            provider key. Defaults to ``"server_default"``.
         embedding_model: Model identifier for the embedding provider.
         vector_dimension: Expected vector dimensionality.
+        reranker_provider: ``"server_default"``, ``"none"``, or an explicit
+            reranker key (``"crossencoder"``/``"voyage"``). Defaults to
+            ``"server_default"``.
+        reranker_model: Model identifier for the reranker, or ``""`` to use
+            the resolved provider's own default model.
         llm_model: LLM model identifier for answer generation.
         enable_generation: Whether to run LLM generation. Defaults to True.
         db_path: Path to the SQLite database file.
@@ -99,13 +129,22 @@ class QueryToolInput(BaseModel):
     context_top_k: int = Field(default=6, ge=1, le=20)
     token_budget: int = Field(default=2048, ge=64, le=8192)
     collection: str = Field(default="default", min_length=1)
-    embedding_provider: Optional[str] = Field(default=None)
+    embedding_provider: EmbeddingProviderEnum = Field(default="server_default")
     embedding_model: str = Field(default="text-embedding-3-small")
     vector_dimension: int = Field(default=1536, ge=1, le=8192)
+    reranker_provider: RerankerProviderEnum = Field(default="server_default")
+    reranker_model: str = Field(default="")
     llm_model: str = Field(default="gpt-4o-mini")
     enable_generation: bool = Field(default=True)
     db_path: str = Field(default="data/rag.db")
     index_dir: str = Field(default="data/indexes")
+
+    _normalize_embedding_provider = field_validator("embedding_provider", mode="before")(
+        _server_default_if_none
+    )
+    _normalize_reranker_provider = field_validator("reranker_provider", mode="before")(
+        _server_default_if_none
+    )
 
     @field_validator("query")
     @classmethod
@@ -263,7 +302,8 @@ class SyncSourceToolInput(BaseModel):
         db_path: Path to the SQLite database file.
         index_dir: Directory for BM25 and FAISS index files.
         token_budget: Maximum tokens per ingested chunk.
-        embedding_provider: Embedding provider key, or None to skip embedding.
+        embedding_provider: ``"server_default"``, ``"none"``, or an explicit
+            provider key. Defaults to ``"server_default"``.
         embedding_model: Model identifier for the embedding provider.
         vector_dimension: Expected vector dimensionality.
     """
@@ -280,9 +320,13 @@ class SyncSourceToolInput(BaseModel):
     db_path: str = Field(default="data/rag.db")
     index_dir: str = Field(default="data/indexes")
     token_budget: int = Field(default=512, ge=64, le=4096)
-    embedding_provider: Optional[str] = Field(default=None)
+    embedding_provider: EmbeddingProviderEnum = Field(default="server_default")
     embedding_model: str = Field(default="text-embedding-3-small")
     vector_dimension: int = Field(default=1536, ge=1, le=8192)
+
+    _normalize_embedding_provider = field_validator("embedding_provider", mode="before")(
+        _server_default_if_none
+    )
 
     @field_validator("connector")
     @classmethod
@@ -336,9 +380,15 @@ class RetrieveInput(BaseModel):
             or ``"knowledge_base"``. When omitted, all collections are searched.
         db_path: Path to the SQLite database file.
         index_dir: Directory for BM25 and FAISS index files.
-        embedding_provider: Embedding provider key, or None to use BM25 only.
+        embedding_provider: ``"server_default"``, ``"none"``, or an explicit
+            provider key. Defaults to ``"server_default"``.
         embedding_model: Model identifier for the embedding provider.
         vector_dimension: Expected vector dimensionality.
+        reranker_provider: ``"server_default"``, ``"none"``, or an explicit
+            reranker key (``"crossencoder"``/``"voyage"``). Defaults to
+            ``"server_default"``.
+        reranker_model: Model identifier for the reranker, or ``""`` to use
+            the resolved provider's own default model.
     """
 
     query: str = Field(..., min_length=1, description="Natural-language search query")
@@ -349,9 +399,18 @@ class RetrieveInput(BaseModel):
     )
     db_path: str = Field(default="data/rag.db")
     index_dir: str = Field(default="data/indexes")
-    embedding_provider: Optional[str] = Field(default=None)
+    embedding_provider: EmbeddingProviderEnum = Field(default="server_default")
     embedding_model: str = Field(default="text-embedding-3-small")
     vector_dimension: int = Field(default=1536, ge=1, le=8192)
+    reranker_provider: RerankerProviderEnum = Field(default="server_default")
+    reranker_model: str = Field(default="")
+
+    _normalize_embedding_provider = field_validator("embedding_provider", mode="before")(
+        _server_default_if_none
+    )
+    _normalize_reranker_provider = field_validator("reranker_provider", mode="before")(
+        _server_default_if_none
+    )
 
     @field_validator("query")
     @classmethod
@@ -378,12 +437,32 @@ class ChunkResult(BaseModel):
 class RetrieveOutput(BaseModel):
     """Output schema for the ``retrieve`` MCP tool.
 
+    Internal failures are raised as real MCP tool errors (``isError=True``
+    with a stable error-code prefix — see ``rag.core.errors``), not encoded
+    in this schema. A ``RetrieveOutput`` is only ever returned on success,
+    including the legal-zero-hits case (``chunks=[]``).
+
     Attributes:
         chunks: Ranked list of retrieved chunks.
-        error: Error message if retrieval failed, or None on success.
+        retrieval_mode: What actually ran: ``"bm25_only"``, ``"hybrid"``, or
+            ``"hybrid_rerank"`` — the resolved config, not just "enabled".
+        embedding_provider: Resolved embedding provider, or None if BM25-only.
+        embedding_model: Resolved embedding model, or None if BM25-only.
+        reranker_provider: Resolved reranker provider, or None if no rerank.
+        degraded_reason: Set only when an incompatible/unavailable vector
+            config was silently downgraded to BM25-only under
+            ``RAG_INDEX_COMPAT_MODE=degraded``. None when strict (the
+            default) or when nothing needed to degrade.
+        error: Deprecated migration-period field, retained for MAEDA's dual-
+            track check (定案 #13) — always None; failures now raise instead.
     """
 
     chunks: list[ChunkResult] = Field(default_factory=list)
+    retrieval_mode: str = ""
+    embedding_provider: Optional[str] = None
+    embedding_model: Optional[str] = None
+    reranker_provider: Optional[str] = None
+    degraded_reason: Optional[str] = None
     error: Optional[str] = None
 
 
@@ -408,12 +487,29 @@ class ChunkResultWithMetadata(BaseModel):
 class RetrieveWithMetadataOutput(BaseModel):
     """Output schema for the ``retrieve_with_metadata`` MCP tool.
 
+    See ``RetrieveOutput`` for the error-handling contract — internal
+    failures raise real MCP tool errors instead of being encoded here.
+
     Attributes:
         chunks: Ranked list of retrieved chunks with explicit metadata fields.
-        error: Error message if retrieval failed, or None on success.
+        retrieval_mode: What actually ran: ``"bm25_only"``, ``"hybrid"``, or
+            ``"hybrid_rerank"``.
+        embedding_provider: Resolved embedding provider, or None if BM25-only.
+        embedding_model: Resolved embedding model, or None if BM25-only.
+        reranker_provider: Resolved reranker provider, or None if no rerank.
+        degraded_reason: Set only when an incompatible/unavailable vector
+            config was silently downgraded to BM25-only under
+            ``RAG_INDEX_COMPAT_MODE=degraded``.
+        error: Deprecated migration-period field — always None; failures
+            now raise instead.
     """
 
     chunks: list[ChunkResultWithMetadata] = Field(default_factory=list)
+    retrieval_mode: str = ""
+    embedding_provider: Optional[str] = None
+    embedding_model: Optional[str] = None
+    reranker_provider: Optional[str] = None
+    degraded_reason: Optional[str] = None
     error: Optional[str] = None
 
 

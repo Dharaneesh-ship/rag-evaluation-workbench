@@ -36,7 +36,12 @@ services:
       - -m
       - rag.app.mcp_server.server
     ports:
-      - "8000:8000"
+      # Unified internal/external port (ECOSYSTEM_INTEGRATION_PLAN.md 定案 #1,
+      # "方案 A"): container-internal and published port must be the same
+      # number, or README/compose/health-check/MAEDA's zero-config default
+      # each end up describing a different value. MAEDA's settings.py reads
+      # 8002 as its RAG_SERVER_MCP_URL default — this must match.
+      - "8002:8002"
     volumes:
       - rag-data:/app/data
     env_file:
@@ -51,6 +56,7 @@ services:
       # loopback-only default) for the published port below to reach it.
       MCP_TRANSPORT: streamable-http
       MCP_HOST: 0.0.0.0
+      MCP_PORT: "8002"
     restart: unless-stopped
     depends_on:
       studio:

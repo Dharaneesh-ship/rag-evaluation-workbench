@@ -311,7 +311,7 @@ docker-compose up --build
 
 This starts two services:
 - **Studio UI** → http://localhost:8501
-- **MCP Server** → http://localhost:8000/mcp (HTTP, only inside Docker — see below)
+- **MCP Server** → http://localhost:8002/mcp (HTTP, only inside Docker — see below)
 
 Your data (database + indexes) is stored in a Docker volume so it persists across restarts.
 
@@ -321,10 +321,17 @@ Your data (database + indexes) is stored in a Docker volume so it persists acros
 > that setup. A detached Docker container has no client attached to its
 > stdin/stdout, so `docker-compose.yml` instead sets `MCP_TRANSPORT=streamable-http`
 > and `MCP_HOST=0.0.0.0`, giving the containerized server an actual HTTP
-> endpoint at `http://localhost:8000/mcp`. If your MCP client supports
+> endpoint at `http://localhost:8002/mcp`. If your MCP client supports
 > connecting to a remote HTTP server (rather than spawning a subprocess),
 > point it at that URL instead of using the `command`/`args`/`cwd` config
 > from §8.
+>
+> **Port 8002 is a fixed ecosystem allocation, not an arbitrary default**:
+> in the MAEDA + rag-framework + data-cleaner integration, rag-framework
+> always runs on 8002 and data-cleaner on 8001, so MAEDA's client config
+> needs zero changes to reach either. Container-internal and
+> published port are kept identical (`8002:8002`) on purpose — see
+> `ECOSYSTEM_INTEGRATION_PLAN.md` 定案 #1.
 
 ### Stop
 
@@ -402,6 +409,90 @@ When your corpus has multiple document types, use the `collection` parameter to 
 # Only search resumes, not the knowledge base
 retrieve(query="What is Rita's GPA?", collection="resumes")
 ```
+
+Requesting a `collection` that no document was ever ingested with raises an
+`INVALID_COLLECTION` error rather than silently searching everything — see
+"Retrieval configuration contract" below.
+
+### Retrieval configuration contract
+
+`retrieve`, `retrieve_with_metadata`, and `rag.query` all take the same
+`embedding_provider` / `reranker_provider` pair, and `rag.ingest` /
+`rag.sync_source` take the matching `embedding_provider` for indexing.
+Each is one of three kinds of value, resolved by
+`rag.app.mcp_server.retrieval_config`:
+
+| Value | Meaning |
+|---|---|
+| `"server_default"` (default) | Defer to this server's configured default — see env vars below. |
+| `"none"` | Explicitly disable this stage (BM25-only, or no reranking) regardless of the server default. |
+| an explicit key (`"openai"` / `"crossencoder"` / `"voyage"`) | Force this stage on with this provider, overriding the server default. |
+
+Provider and model are independent: `embedding_model` / `reranker_model`
+are plain strings, always taken from the request (an empty `reranker_model`
+falls back to the resolved provider's own default model). Omitting the
+field, or sending an explicit `null`, is normalized to `"server_default"`
+for backward compatibility with older clients.
+
+**Server-side defaults** (env vars, read at call time):
+
+| Env var | Default | Effect |
+|---|---|---|
+| `RAG_EMBEDDING_PROVIDER_DEFAULT` | `none` | What `"server_default"` resolves to for `embedding_provider`. Set to `openai` to make retrieval hybrid by default. |
+| `RAG_RERANKER_PROVIDER_DEFAULT` | `none` | What `"server_default"` resolves to for `reranker_provider`. Set to `crossencoder` or `voyage` to rerank by default. |
+| `RAG_INDEX_COMPAT_MODE` | `strict` | `strict`: an incompatible/missing vector index, or an unavailable provider dependency (missing API key/package), raises a real MCP tool error. `degraded`: silently falls back to BM25-only, recording why in the response's `degraded_reason` field and in the trace. Mirrors MAEDA's own `MCP_STRICT_MODE` split — use `degraded` for demos only. |
+
+**Index compatibility**: a saved index directory records what it was
+embedded with (`index_manifest.json` — provider, model, dimension). A
+query requesting vector search against an index that was never embedded,
+or embedded with a different provider/model/dimension, is a contract
+error, not a silent degrade — this is what prevents a "假 hybrid" false
+positive (config says vectors are on, but the corpus was actually never
+vectorized). Ingesting into an `index_dir` that already holds vectors from
+a *different* embedding configuration is rejected outright, in both
+modes — mixing embedding spaces in one FAISS index isn't a legitimate
+degrade path, it's index corruption.
+
+**Stable error codes** — internal failures raise a real MCP tool error
+(`isError=True`) whose text is prefixed with one of these, followed by a
+free-form (unstable) detail message:
+
+| Code | Meaning |
+|---|---|
+| `INDEX_NOT_FOUND` | Vector search requested but this index_dir was never embedded. |
+| `INDEX_CONFIG_MISMATCH` | Vector search requested but the index was built with a different provider/model/dimension. |
+| `EMBEDDING_PROVIDER_UNAVAILABLE` | The resolved embedding provider's API key or package is unavailable. |
+| `RERANKER_UNAVAILABLE` | The resolved reranker's API key or package is unavailable. |
+| `INVALID_COLLECTION` | The requested `collection` was never used to tag any document. |
+| `RETRIEVAL_INTERNAL_ERROR` | Any other unexpected failure inside the retrieval pipeline. |
+
+A legal zero-hit query (no chunks matched) is a normal success with
+`chunks=[]` — it is never one of the above.
+
+`retrieve` and `retrieve_with_metadata` responses also report what
+actually ran: `retrieval_mode` (`"bm25_only"` / `"hybrid"` /
+`"hybrid_rerank"`), `embedding_provider`, `embedding_model`,
+`reranker_provider`, and `degraded_reason`.
+
+### Reranker operational notes
+
+- **Default**: no reranker (`RAG_RERANKER_PROVIDER_DEFAULT=none`) — set it
+  explicitly to opt in.
+- **CrossEncoder** (`crossencoder`, local, no API key): default model
+  `cross-encoder/ms-marco-MiniLM-L-6-v2` via `sentence-transformers`, which
+  caches downloaded weights under `~/.cache/torch/sentence_transformers`
+  (override with `HF_HOME`/`SENTENCE_TRANSFORMERS_HOME`). There is no
+  startup warm-up — the ~80 MB download happens lazily on the first
+  `crossencoder` request, so the first call after a cold start is
+  noticeably slower than the rest; a fully offline environment with no
+  cached weights fails that first call with `RERANKER_UNAVAILABLE`.
+- **Voyage** (`voyage`, API-backed): requires `VOYAGE_API_KEY`; missing it
+  fails fast with `RERANKER_UNAVAILABLE` before any network call, rather
+  than surfacing an opaque API error mid-query.
+- Either provider failing to construct is always a hard failure
+  (`RERANKER_UNAVAILABLE`), never a silent "skip reranking and continue" —
+  `RAG_INDEX_COMPAT_MODE=degraded` only governs the embedding/vector-index
+  compatibility check, not reranker availability.
 
 ---
 

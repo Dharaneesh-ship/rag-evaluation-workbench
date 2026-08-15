@@ -366,7 +366,9 @@ class TestSyncSourceSchemas:
         assert inp.db_path == "data/rag.db"
         assert inp.index_dir == "data/indexes"
         assert inp.since_cursor is None
-        assert inp.embedding_provider is None
+        # 定案 #7: unset embedding_provider now normalizes to "server_default"
+        # (deferring to the service's configured default) rather than None.
+        assert inp.embedding_provider == "server_default"
 
     def test_output_model(self):
         from rag.app.mcp_server.schemas import SyncSourceToolOutput

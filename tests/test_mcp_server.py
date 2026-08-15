@@ -388,7 +388,7 @@ class TestTransportConfigFromEnv:
             self._reload_server_module()
             _, kwargs = MockFastMCP.call_args
             assert kwargs["host"] == "127.0.0.1"
-            assert kwargs["port"] == 8000
+            assert kwargs["port"] == 8002
         self._reload_server_module()
 
     def test_run_uses_transport_from_env(self, monkeypatch):

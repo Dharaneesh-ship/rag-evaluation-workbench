@@ -35,7 +35,10 @@ dependencies = [
     # sqlite3 is part of Python standard library
 
     # MCP server
-    "mcp>=1.0.0",
+    # Upper-bounded: 2.0.0 restructured the package layout (no more
+    # mcp.server.fastmcp), which breaks this server's import at startup.
+    # See ECOSYSTEM_INTEGRATION_PLAN.md appendix F.4/G2.
+    "mcp>=1.0.0,<2.0.0",
 
     # UI
     "streamlit>=1.35.0",

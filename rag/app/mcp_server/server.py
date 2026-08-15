@@ -12,9 +12,12 @@ import builtins
 import logging
 import os
 import sys
+from dataclasses import dataclass
+from typing import Optional
 
 from mcp.server.fastmcp import FastMCP
 
+from rag.core.errors import InvalidCollectionError, RagMCPError, RetrievalInternalError
 from rag.app.mcp_server.schemas import (
     CitationOutput,
     ChunkResult,
@@ -53,7 +56,10 @@ mcp = FastMCP(
     # to loopback-only; set to 0.0.0.0 (as docker-compose.yml does) so the
     # container's published port is actually reachable from outside it.
     host=os.environ.get("MCP_HOST", "127.0.0.1"),
-    port=int(os.environ.get("MCP_PORT", "8000")),
+    # 8002 matches the ecosystem-wide port allocation (rag-framework=8002,
+    # data-cleaner=8001) that MAEDA's settings.py assumes by default — see
+    # ECOSYSTEM_INTEGRATION_PLAN.md 定案 #1.
+    port=int(os.environ.get("MCP_PORT", "8002")),
 )
 
 
@@ -396,24 +402,93 @@ def rag_sync_source(input: SyncSourceToolInput) -> SyncSourceToolOutput:
 # ---------------------------------------------------------------------------
 
 
-def _run_retrieval(input: RetrieveInput):
-    """Shared retrieval logic used by retrieve and retrieve_with_metadata."""
+def _known_collections(db_path: str) -> set[str]:
+    """Return the set of collection names actually tagged on ingested documents.
+
+    Only explicitly-tagged collections count — an untagged document is only
+    reachable by an unscoped (``collection=None``) query (see the collection
+    isolation fix in commit 91bf15d), so an empty return here means "nothing
+    has been tagged yet," not "no documents exist."
+    """
+    from rag.infra.stores.docstore_sqlite import SQLiteDocStore
+
+    doc_store = SQLiteDocStore(db_path)
+    return {doc["collection"] for doc in doc_store.list_documents() if doc.get("collection")}
+
+
+@dataclass
+class _RetrievalResolution:
+    """Bundles a retrieval run's result with what config actually executed.
+
+    ``QueryPipeline.query()`` on its own only reports ``QueryResult`` —
+    exactly what mode/provider/reranker actually ran (vs. what was merely
+    requested) has to be tracked alongside it so ``retrieve``/
+    ``retrieve_with_metadata`` can surface it in their responses and traces
+    (TB1a/TB2's "trace 需记录本次实际执行的 retrieval mode、provider、
+    model、reranker、降级原因" requirement).
+    """
+
+    query_result: "object"
+    retrieval_mode: str
+    embedding_provider: Optional[str]
+    embedding_model: Optional[str]
+    reranker_provider: Optional[str]
+    degraded_reason: Optional[str]
+
+
+def _run_retrieval(input: RetrieveInput) -> _RetrievalResolution:
+    """Shared retrieval logic used by retrieve and retrieve_with_metadata.
+
+    Raises:
+        InvalidCollectionError: ``input.collection`` was given but no
+            document was ever tagged with it.
+        IndexNotFoundError: Vector search was resolved but no compatible
+            index exists (strict mode only).
+        IndexConfigMismatchError: Vector search was resolved but the index
+            was built with a different provider/model/dimension (strict
+            mode only).
+        EmbeddingProviderUnavailableError: The resolved embedding provider's
+            dependency (API key, package) is unavailable.
+        RerankerUnavailableError: The resolved reranker's dependency (API
+            key, package) is unavailable.
+        RetrievalInternalError: The pipeline itself failed at query time —
+            previously this was silently absorbed into an ``error`` field on
+            an otherwise-successful-looking empty result (定案 #13).
+    """
+    from rag.app.mcp_server.index_validation import validate_index_compatibility
+    from rag.app.mcp_server.retrieval_config import (
+        build_embedding_provider,
+        build_reranker,
+        resolve_embedding_config,
+        resolve_reranker_config,
+    )
     from rag.infra.indexes.index_manager import IndexManager
     from rag.infra.stores.tracestore_sqlite import SQLiteTraceStore
     from rag.pipelines.query_pipeline import QueryPipeline
 
+    if input.collection:
+        known = _known_collections(input.db_path)
+        if known and input.collection not in known:
+            raise InvalidCollectionError(
+                f"Collection '{input.collection}' does not exist. "
+                f"Known collections: {sorted(known)}."
+            )
+
     mgr = IndexManager(index_dir=input.index_dir)
     trace_store = SQLiteTraceStore(input.db_path)
 
+    resolved_embed = resolve_embedding_config(
+        input.embedding_provider, input.embedding_model, input.vector_dimension
+    )
+    validation = validate_index_compatibility(mgr, resolved_embed)
     embed_provider = None
     vec_index = None
-    if input.embedding_provider == "openai":
-        from rag.infra.embedding.openai_embedding import OpenAIEmbeddingProvider
-        embed_provider = OpenAIEmbeddingProvider(
-            model=input.embedding_model,
-            dimensions=input.vector_dimension,
-        )
+    if validation.use_vector_search:
+        embed_provider = build_embedding_provider(resolved_embed)
         vec_index = mgr.faiss
+
+    resolved_rerank = resolve_reranker_config(input.reranker_provider, input.reranker_model)
+    reranker = build_reranker(resolved_rerank)
 
     pipeline = QueryPipeline(
         keyword_index=mgr.bm25,
@@ -421,11 +496,49 @@ def _run_retrieval(input: RetrieveInput):
         vector_index=vec_index,
         embedding_provider=embed_provider,
         answer_composer=None,   # retrieval only, no LLM
-        reranker=None,
+        reranker=reranker,
         top_k=input.top_k,
     )
     result = pipeline.query(input.query, collection=input.collection)
-    return result
+
+    if result.error:
+        # QueryPipeline.query() catches its own internal exceptions into
+        # .error and still returns a "successful" QueryResult — left alone,
+        # that becomes an internal failure indistinguishable from a
+        # legitimate empty result once wrapped in RetrieveOutput(chunks=[]).
+        # Raise instead, so it surfaces as a real MCP tool error.
+        raise RetrievalInternalError(result.error)
+
+    if vec_index is not None and reranker is not None:
+        mode = "hybrid_rerank"
+    elif vec_index is not None:
+        mode = "hybrid"
+    else:
+        mode = "bm25_only"
+
+    resolved_provider = resolved_embed.provider if vec_index is not None else None
+    resolved_model = resolved_embed.model if vec_index is not None else None
+
+    trace_store.save_run(
+        run_type="retrieval_config",
+        metadata={
+            "run_id": result.run_id,
+            "retrieval_mode": mode,
+            "embedding_provider": resolved_provider,
+            "embedding_model": resolved_model,
+            "reranker_provider": resolved_rerank.provider,
+            "degraded_reason": validation.degraded_reason,
+        },
+    )
+
+    return _RetrievalResolution(
+        query_result=result,
+        retrieval_mode=mode,
+        embedding_provider=resolved_provider,
+        embedding_model=resolved_model,
+        reranker_provider=resolved_rerank.provider,
+        degraded_reason=validation.degraded_reason,
+    )
 
 
 @mcp.tool(
@@ -439,35 +552,54 @@ def _run_retrieval(input: RetrieveInput):
 def retrieve(input: RetrieveInput) -> RetrieveOutput:
     """Retrieve ranked chunks for a query.
 
+    Internal failures (missing/incompatible index, unavailable embedding or
+    reranker dependency, invalid collection, pipeline error) raise a
+    ``RagMCPError`` subclass with a stable error-code prefix, which FastMCP
+    surfaces as a real MCP tool error (``isError=True``) — see
+    ``rag.core.errors``. Legal zero hits are a normal success with
+    ``chunks=[]``.
+
     Args:
         input: Validated RetrieveInput payload.
 
     Returns:
-        RetrieveOutput with a ranked list of chunks (content, score, metadata).
+        RetrieveOutput with a ranked list of chunks (content, score, metadata)
+        plus the retrieval config that actually executed.
     """
     logger.info("retrieve called: query=%r top_k=%d", input.query, input.top_k)
     try:
-        result = _run_retrieval(input)
-        chunks = []
-        for cand in result.candidates[: input.top_k]:
-            chunks.append(
-                ChunkResult(
-                    content=cand.display_text,
-                    score=float(cand.final_score),
-                    metadata={
-                        "chunk_id": cand.chunk_id,
-                        "doc_id": cand.doc_id,
-                        "source_path": cand.metadata.get("source_path", ""),
-                        "page": cand.metadata.get("start_page") or cand.metadata.get("page"),
-                        "retrieval_source": cand.source_label,
-                        "rrf_score": cand.rrf_score,
-                    },
-                )
-            )
-        return RetrieveOutput(chunks=chunks)
+        resolution = _run_retrieval(input)
+    except RagMCPError:
+        raise
     except Exception as exc:
         logger.exception("retrieve failed: %s", exc)
-        return RetrieveOutput(error=str(exc))
+        raise RetrievalInternalError(str(exc)) from exc
+
+    result = resolution.query_result
+    chunks = []
+    for cand in result.candidates[: input.top_k]:
+        chunks.append(
+            ChunkResult(
+                content=cand.display_text,
+                score=float(cand.final_score),
+                metadata={
+                    "chunk_id": cand.chunk_id,
+                    "doc_id": cand.doc_id,
+                    "source_path": cand.metadata.get("source_path", ""),
+                    "page": cand.metadata.get("start_page") or cand.metadata.get("page"),
+                    "retrieval_source": cand.source_label,
+                    "rrf_score": cand.rrf_score,
+                },
+            )
+        )
+    return RetrieveOutput(
+        chunks=chunks,
+        retrieval_mode=resolution.retrieval_mode,
+        embedding_provider=resolution.embedding_provider,
+        embedding_model=resolution.embedding_model,
+        reranker_provider=resolution.reranker_provider,
+        degraded_reason=resolution.degraded_reason,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -486,35 +618,49 @@ def retrieve(input: RetrieveInput) -> RetrieveOutput:
 def retrieve_with_metadata(input: RetrieveInput) -> RetrieveWithMetadataOutput:
     """Retrieve ranked chunks with explicit metadata fields.
 
+    See ``retrieve`` for the error-handling contract — internal failures
+    raise a ``RagMCPError`` subclass instead of being encoded in the response.
+
     Args:
         input: Validated RetrieveInput payload.
 
     Returns:
         RetrieveWithMetadataOutput with chunks containing content, score,
-        source_file, page, and chunk_id.
+        source_file, page, and chunk_id, plus the retrieval config that
+        actually executed.
     """
     logger.info("retrieve_with_metadata called: query=%r top_k=%d", input.query, input.top_k)
     try:
-        import os
-        result = _run_retrieval(input)
-        chunks = []
-        for cand in result.candidates[: input.top_k]:
-            source_path = cand.metadata.get("source_path", "") or ""
-            source_file = os.path.basename(source_path) or cand.doc_id
-            page = cand.metadata.get("start_page") or cand.metadata.get("page")
-            chunks.append(
-                ChunkResultWithMetadata(
-                    content=cand.display_text,
-                    score=float(cand.final_score),
-                    source_file=source_file,
-                    page=page,
-                    chunk_id=cand.chunk_id,
-                )
-            )
-        return RetrieveWithMetadataOutput(chunks=chunks)
+        resolution = _run_retrieval(input)
+    except RagMCPError:
+        raise
     except Exception as exc:
         logger.exception("retrieve_with_metadata failed: %s", exc)
-        return RetrieveWithMetadataOutput(error=str(exc))
+        raise RetrievalInternalError(str(exc)) from exc
+
+    result = resolution.query_result
+    chunks = []
+    for cand in result.candidates[: input.top_k]:
+        source_path = cand.metadata.get("source_path", "") or ""
+        source_file = os.path.basename(source_path) or cand.doc_id
+        page = cand.metadata.get("start_page") or cand.metadata.get("page")
+        chunks.append(
+            ChunkResultWithMetadata(
+                content=cand.display_text,
+                score=float(cand.final_score),
+                source_file=source_file,
+                page=page,
+                chunk_id=cand.chunk_id,
+            )
+        )
+    return RetrieveWithMetadataOutput(
+        chunks=chunks,
+        retrieval_mode=resolution.retrieval_mode,
+        embedding_provider=resolution.embedding_provider,
+        embedding_model=resolution.embedding_model,
+        reranker_provider=resolution.reranker_provider,
+        degraded_reason=resolution.degraded_reason,
+    )
 
 
 # ---------------------------------------------------------------------------

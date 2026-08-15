@@ -102,10 +102,8 @@ def main(argv: list[str] | None = None) -> int:
     Returns:
         Exit code: 0 on success, 1 on failure.
     """
-    from rag.infra.indexes.index_manager import IndexManager
-    from rag.infra.stores.docstore_sqlite import SQLiteDocStore
-    from rag.infra.stores.tracestore_sqlite import SQLiteTraceStore
-    from rag.pipelines.query_pipeline import QueryPipeline
+    from rag.app.mcp_server.wiring import build_query_pipeline
+    from rag.core.errors import RagMCPError
 
     args = _build_parser().parse_args(argv)
 
@@ -124,17 +122,20 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
-    trace_store = SQLiteTraceStore(db_path)
-
-    # Load indexes — starts empty if no saved files yet (graceful first-run)
-    manager = IndexManager(index_dir)
-
-    pipeline = QueryPipeline(
-        keyword_index=manager.bm25,
-        vector_index=manager.faiss,
-        trace_store=trace_store,
-        top_k=args.top_k,
-    )
+    # Routed through the same config resolution as the MCP retrieve tools
+    # (rag.app.mcp_server.retrieval_config) so this CLI can't silently drift
+    # from what retrieve/retrieve_with_metadata actually do — see R2's
+    # "统一...配置解析" requirement.
+    try:
+        pipeline = build_query_pipeline(
+            db_path=str(db_path),
+            index_dir=str(index_dir),
+            top_k=args.top_k,
+            enable_generation=False,
+        )
+    except RagMCPError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
 
     result = pipeline.query(args.query)
 

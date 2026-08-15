@@ -8,6 +8,7 @@ from filelock import FileLock, Timeout as _FileLockTimeout
 
 from rag.infra.indexes.bm25_local import BM25LocalIndex, _INDEX_FILENAME as _BM25_FILE
 from rag.infra.indexes.faiss_local import FaissLocalIndex, _INDEX_FILENAME as _FAISS_FILE
+from rag.infra.indexes.manifest import IndexManifest
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +53,7 @@ class IndexManager:
         self._index_dir = Path(index_dir)
         self.bm25: BM25LocalIndex = BM25LocalIndex()
         self.faiss: FaissLocalIndex = FaissLocalIndex()
+        self.manifest: IndexManifest = IndexManifest.empty()
         self._load_if_exists()
 
     # ── Internal ──────────────────────────────────────────────────────────────
@@ -93,17 +95,48 @@ class IndexManager:
                 "No FAISS index found at '%s'. Starting with empty index.", self._index_dir
             )
 
+        self.manifest = IndexManifest.load(self._index_dir)
+
     # ── Public API ────────────────────────────────────────────────────────────
 
+    def record_embedding_config(
+        self,
+        provider: str | None,
+        model: str | None,
+        dimension: int | None,
+    ) -> None:
+        """Record the embedding configuration that produced this index's vectors.
+
+        Called once vectors have actually been added during an ingest — see
+        ``rag.app.mcp_server.retrieval_config`` for how ``provider`` is
+        resolved from a request's ``embedding_provider`` enum. Persisted by
+        the next :meth:`save`.
+
+        Args:
+            provider: Concrete provider key (e.g. ``"openai"``), or None —
+                a no-op, since a BM25-only ingest doesn't change what
+                vectors (if any) already exist in this index_dir.
+            model: Embedding model identifier.
+            dimension: Vector dimensionality.
+        """
+        if provider is None:
+            return
+        self.manifest = IndexManifest(
+            embedding_provider=provider,
+            embedding_model=model,
+            vector_dimension=dimension,
+        )
+
     def save(self) -> None:
-        """Persist both indexes to disk.
+        """Persist both indexes and the manifest to disk.
 
         Creates ``index_dir`` if it does not yet exist.
         """
         self._index_dir.mkdir(parents=True, exist_ok=True)
         self.bm25.save(str(self._index_dir))
         self.faiss.save(str(self._index_dir))
-        logger.info("BM25 and FAISS indexes saved to '%s'.", self._index_dir)
+        self.manifest.save(self._index_dir)
+        logger.info("BM25, FAISS indexes and manifest saved to '%s'.", self._index_dir)
 
     def reload(self) -> None:
         """Reload both indexes from disk, replacing current in-memory state.

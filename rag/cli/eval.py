@@ -90,6 +90,21 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Print per-case retrieved chunk IDs.",
     )
+    parser.add_argument(
+        "--embedding-provider",
+        default="server_default",
+        dest="embedding_provider",
+        choices=["server_default", "none", "openai"],
+        help="Embedding provider for retrieval. Defaults to 'server_default' "
+             "(the service's configured default; see README §8).",
+    )
+    parser.add_argument(
+        "--reranker-provider",
+        default="server_default",
+        dest="reranker_provider",
+        choices=["server_default", "none", "crossencoder", "voyage"],
+        help="Reranker provider for retrieval. Defaults to 'server_default'.",
+    )
     return parser
 
 
@@ -144,6 +159,8 @@ def _run_queries(
     db_path: Path,
     index_dir: Path,
     top_k: int,
+    embedding_provider: str = "server_default",
+    reranker_provider: str = "server_default",
 ) -> list[dict]:
     """Run each suite entry through the query pipeline and collect results.
 
@@ -152,22 +169,25 @@ def _run_queries(
         db_path: SQLite database path.
         index_dir: Index directory path.
         top_k: Number of candidates to retrieve.
+        embedding_provider: ``"server_default"``, ``"none"``, or an explicit
+            provider key — resolved via the same
+            ``rag.app.mcp_server.retrieval_config`` path as the MCP
+            retrieve tools (R2's "评测入口" shares config resolution too).
+        reranker_provider: ``"server_default"``, ``"none"``, or an explicit
+            reranker key.
 
     Returns:
         List of result dicts suitable for ``run_eval()``.
     """
-    from rag.infra.indexes.index_manager import IndexManager
-    from rag.infra.stores.tracestore_sqlite import SQLiteTraceStore
-    from rag.pipelines.query_pipeline import QueryPipeline
+    from rag.app.mcp_server.wiring import build_query_pipeline
 
-    trace_store = SQLiteTraceStore(db_path)
-    manager = IndexManager(index_dir)
-    pipeline = QueryPipeline(
-        keyword_index=manager.bm25,
-        vector_index=manager.faiss,
-        trace_store=trace_store,
+    pipeline = build_query_pipeline(
+        db_path=str(db_path),
+        index_dir=str(index_dir),
         top_k=top_k,
-        answer_composer=None,  # skip LLM generation in eval
+        enable_generation=False,  # skip LLM generation in eval
+        embedding_provider=embedding_provider,
+        reranker_provider=reranker_provider,
     )
 
     results = []
@@ -351,7 +371,14 @@ def main(argv: list[str] | None = None) -> int:
 
     # Run queries
     try:
-        results = _run_queries(entries, db_path, index_dir, top_k=args.top_k)
+        results = _run_queries(
+            entries,
+            db_path,
+            index_dir,
+            top_k=args.top_k,
+            embedding_provider=args.embedding_provider,
+            reranker_provider=args.reranker_provider,
+        )
     except Exception as exc:
         print(f"Error: unexpected failure during query execution: {exc}", file=sys.stderr)
         return 1
