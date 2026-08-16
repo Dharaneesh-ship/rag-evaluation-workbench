@@ -1,0 +1,249 @@
+# Event script — ground truth for the RAG on/off A/B evaluation.
+# Candidate content, pending three-party review (ECOSYSTEM_INTEGRATION_PLAN.md
+# 附录 X.7 step 4). Do NOT generate demo data or corpus from this file until
+# it is frozen (step 5) — see 附录 Z for rag-framework's sign-off on the
+# schema this file follows.
+#
+# `split` is not author-assigned — it is recomputed deterministically by
+# verify.py per 附录 X.4 and must match what's recorded here.
+schema_version: "1"
+script_version: "1"
+
+events:
+  # ---------------------------------------------------------------------
+  # normal (7) — has both data_signal and corpus_evidence: tests
+  # attribution accuracy (does the model cite the real cause?).
+  # ---------------------------------------------------------------------
+  - event_id: "EVT-2023-07-EAST-STOCKOUT"
+    event_type: normal
+    split: test
+    business_description: "华东区主力型号断货,持续到八月中旬补货"
+    valid_from: "2023-07-05"
+    valid_to: "2023-08-14"
+    data_signal:
+      metric: revenue
+      segment: {region: "East"}
+      direction: down
+      magnitude: 0.30
+      shape: step
+    corpus_evidence:
+      relevance: relevant
+      source_types: [email, meeting_notes]
+      required_facts: ["断货", "补货时间"]
+      lexical_divergence: [synonym, colloquial]
+    probe_queries:
+      - "华东区七月收入为什么下滑"
+      - "东区七八月份销售额走低是什么原因"
+
+  - event_id: "EVT-2022-11-NORTH-PROMO"
+    event_type: normal
+    split: test
+    business_description: "北区双十一大促,Widget A 收入大幅拉升"
+    valid_from: "2022-11-08"
+    valid_to: "2022-11-15"
+    data_signal:
+      metric: revenue
+      segment: {region: "North", product: "Widget A"}
+      direction: up
+      magnitude: 0.28
+      shape: spike
+    corpus_evidence:
+      relevance: relevant
+      source_types: [promo_calendar, email]
+      required_facts: ["限时满减", "大促报名"]
+      lexical_divergence: [synonym, implicit]
+    probe_queries:
+      - "北区十一月收入为什么突然增长"
+      - "North region November revenue spike explanation"
+
+  - event_id: "EVT-2023-03-SOUTH-ONLINE-POLICY"
+    event_type: normal
+    split: dev
+    business_description: "南区线上渠道退款审核周期拉长,导致确认收入延迟"
+    valid_from: "2023-03-01"
+    valid_to: "2023-03-31"
+    data_signal:
+      metric: revenue
+      segment: {region: "South", channel: "Online"}
+      direction: down
+      magnitude: 0.15
+      shape: ramp
+    corpus_evidence:
+      relevance: relevant
+      source_types: [policy_memo]
+      required_facts: ["退款审核延长", "线上结算规则调整"]
+      lexical_divergence: [implicit, abbreviation]
+    probe_queries:
+      - "南区线上渠道三月表现为何变差"
+      - "South Online channel underperformance in March"
+
+  - event_id: "EVT-2022-06-WEST-WIDGETB-LAUNCH"
+    event_type: normal
+    split: dev
+    business_description: "西区 Widget B 新品首发,首批渠道备货带动出货量"
+    valid_from: "2022-06-01"
+    valid_to: "2022-06-10"
+    data_signal:
+      metric: units
+      segment: {region: "West", product: "Widget B"}
+      direction: up
+      magnitude: 0.40
+      shape: spike
+    corpus_evidence:
+      relevance: relevant
+      source_types: [meeting_notes, email]
+      required_facts: ["新品首发", "渠道铺货"]
+      lexical_divergence: [synonym]
+    probe_queries:
+      - "西区六月出货量为何激增"
+      - "West region shipment surge in early June, why"
+
+  - event_id: "EVT-2024-01-CENTRAL-RETURN-POLICY"
+    event_type: normal
+    split: test
+    business_description: "中区调整退货政策,部分老客户流失导致收入走低"
+    valid_from: "2024-01-01"
+    valid_to: "2024-01-31"
+    data_signal:
+      metric: revenue
+      segment: {region: "Central"}
+      direction: down
+      magnitude: 0.20
+      shape: step
+    corpus_evidence:
+      relevance: relevant
+      source_types: [policy_memo, email]
+      required_facts: ["退货规则收紧", "老客户投诉"]
+      lexical_divergence: [colloquial, implicit]
+    probe_queries:
+      - "中区一月收入下滑的原因是什么"
+      - "为什么中区今年开年营收不如去年"
+
+  - event_id: "EVT-2023-09-EAST-PARTNER-DISPUTE"
+    event_type: normal
+    split: dev
+    business_description: "华东合作伙伴渠道因结算纠纷暂停发货三周"
+    valid_from: "2023-09-01"
+    valid_to: "2023-09-21"
+    data_signal:
+      metric: revenue
+      segment: {region: "East", channel: "Partner"}
+      direction: down
+      magnitude: 0.18
+      shape: ramp
+    corpus_evidence:
+      relevance: relevant
+      source_types: [email, meeting_notes]
+      required_facts: ["结算纠纷", "暂停发货"]
+      lexical_divergence: [synonym, abbreviation]
+    probe_queries:
+      - "华东合作渠道九月收入为什么走低"
+      - "East Partner channel revenue dip in September"
+
+  - event_id: "EVT-2024-05-NORTH-GADGETPRO-EOL"
+    event_type: normal
+    split: dev
+    business_description: "北区 Gadget Pro 停产清仓,收入明显回落"
+    valid_from: "2024-05-01"
+    valid_to: "2024-06-15"
+    data_signal:
+      metric: revenue
+      segment: {region: "North", product: "Gadget Pro"}
+      direction: down
+      magnitude: 0.35
+      shape: step
+    corpus_evidence:
+      relevance: relevant
+      source_types: [meeting_notes, policy_memo]
+      required_facts: ["产品停产", "库存清仓价"]
+      lexical_divergence: [implicit]
+    probe_queries:
+      - "北区五月某型号收入骤降的原因"
+      - "为什么北区二季度有个产品线收入掉得厉害"
+
+  # ---------------------------------------------------------------------
+  # distractor (3) — corpus_evidence only, no data_signal: something the
+  # corpus documents but that never produced a measurable signal. Tests
+  # whether the model wrongly cites it anyway (false attribution rate).
+  # ---------------------------------------------------------------------
+  - event_id: "EVT-2023-04-SOUTH-DISCOUNT-CAMPAIGN"
+    event_type: distractor
+    split: dev
+    business_description: "南区四月上线满减促销,但活动效果未达预期,籍此未观察到收入端的明显提升"
+    valid_from: "2023-04-01"
+    valid_to: "2023-04-30"
+    corpus_evidence:
+      relevance: relevant
+      source_types: [promo_calendar, email]
+      required_facts: ["满减活动", "未达预期"]
+      lexical_divergence: [synonym]
+    probe_queries:
+      - "南区四月的促销活动带来了多少增量收入"
+      - "South April discount campaign, did revenue actually move"
+
+  - event_id: "EVT-2023-12-WEST-WAREHOUSE-MOVE"
+    event_type: distractor
+    split: test
+    business_description: "西区仓库十二月完成搬迁,团队担心会影响发货时效,但实际未造成收入波动"
+    valid_from: "2023-12-01"
+    valid_to: "2023-12-20"
+    corpus_evidence:
+      relevance: partial
+      source_types: [meeting_notes]
+      required_facts: ["仓库搬迁", "物流交接"]
+      lexical_divergence: [colloquial]
+    probe_queries:
+      - "西区十二月是否有物流方面的变动影响了收入"
+      - "Did any December operational change affect West region revenue"
+
+  - event_id: "EVT-2024-08-CENTRAL-PRICE-REVIEW"
+    event_type: distractor
+    split: dev
+    business_description: "中区八月启动了一轮定价评审,讨论是否上调部分型号价格,最终未执行调价"
+    valid_from: "2024-08-01"
+    valid_to: "2024-08-31"
+    corpus_evidence:
+      relevance: partial
+      source_types: [policy_memo]
+      required_facts: ["定价评审", "未执行调价"]
+      lexical_divergence: [abbreviation, implicit]
+    probe_queries:
+      - "中区八月是否调整了产品定价"
+      - "Did Central region change any product pricing in August"
+
+  # ---------------------------------------------------------------------
+  # unexplained (2) — data_signal only, no corpus_evidence: a real
+  # anomaly with nothing in the corpus to explain it. Tests hallucination
+  # rate when RAG is off (does the model admit it doesn't know?).
+  # ---------------------------------------------------------------------
+  - event_id: "EVT-2023-Q3-GLOBAL-UNEXPLAINED-DIP"
+    event_type: unexplained
+    split: dev
+    business_description: "2023 年三季度全网收入整体走低,幅度覆盖所有大区,语料中无任何记载"
+    valid_from: "2023-07-01"
+    valid_to: "2023-09-30"
+    data_signal:
+      metric: revenue
+      segment: {}
+      direction: down
+      magnitude: 0.30
+      shape: step
+    probe_queries:
+      - "2023年三季度全网收入为什么整体下滑"
+      - "Why did overall revenue drop across every region in Q3 2023"
+
+  - event_id: "EVT-2024-03-SOUTH-UNITS-SPIKE"
+    event_type: unexplained
+    split: test
+    business_description: "南区三月出现一次短暂的出货量异常拉升,语料中无任何记载"
+    valid_from: "2024-03-10"
+    valid_to: "2024-03-12"
+    data_signal:
+      metric: units
+      segment: {region: "South"}
+      direction: up
+      magnitude: 0.22
+      shape: spike
+    probe_queries:
+      - "南区三月出货量异常波动的原因是什么"
+      - "South region units spike in mid-March 2024, what caused it"
