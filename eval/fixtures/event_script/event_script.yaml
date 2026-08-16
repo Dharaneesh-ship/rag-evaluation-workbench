@@ -43,7 +43,7 @@ events:
     valid_to: "2022-11-15"
     data_signal:
       metric: revenue
-      segment: {region: "North", product: "Widget A"}
+      segment: {region: "North"}
       direction: up
       magnitude: 0.28
       shape: spike
@@ -85,7 +85,7 @@ events:
     valid_to: "2022-06-10"
     data_signal:
       metric: units
-      segment: {region: "West", product: "Widget B"}
+      segment: {region: "West"}
       direction: up
       magnitude: 0.40
       shape: spike
@@ -148,7 +148,7 @@ events:
     valid_to: "2024-06-15"
     data_signal:
       metric: revenue
-      segment: {region: "North", product: "Gadget Pro"}
+      segment: {region: "North"}
       direction: down
       magnitude: 0.35
       shape: step
@@ -235,15 +235,16 @@ events:
   - event_id: "EVT-2024-03-SOUTH-UNITS-SPIKE"
     event_type: unexplained
     split: test
-    business_description: "南区三月出现一次短暂的出货量异常拉升,语料中无任何记载"
-    valid_from: "2024-03-10"
-    valid_to: "2024-03-12"
+    business_description: "南区三月出货量整月维持在异常偏高的水平,语料中无任何记载"
+    valid_from: "2024-03-01"
+    valid_to: "2024-03-28"
     data_signal:
       metric: units
       segment: {region: "South"}
       direction: up
       magnitude: 0.22
-      shape: spike
+      shape: step  # 附录 AF 裁定:整月恒定抬升,非渐变、非单点
+                   # event_id 中的 "SPIKE" 为历史命名,不再反映 shape
     probe_queries:
-      - "南区三月出货量异常波动的原因是什么"
-      - "South region units spike in mid-March 2024, what caused it"
+      - "南区三月出货量异常偏高的原因是什么"
+      - "South region units stayed anomalously high through March 2024, what caused it"

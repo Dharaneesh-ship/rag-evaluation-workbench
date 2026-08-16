@@ -11,20 +11,38 @@ Usage::
 
     python verify.py                  # check only, exit 1 on any failure
     python verify.py --write-manifest # also write event_script.manifest.json
+    python verify.py --data-path sales_data.csv  # step-6 detectability gate
 
 ``--write-manifest`` is the X.7 step-5 freeze action — do not run it before
 the three-party content review in step 4 has actually happened. It fills in
 ``sha256``/``counts``/``split_counts`` but deliberately leaves
 ``frozen_at``/``git_tag`` for whoever performs the actual freeze ceremony to
 fill in by hand, since a git tag doesn't exist yet when this file is edited.
+
+``--data-path`` is the X.7 step-6 acceptance gate (附录 AF.1/AF.3, folding in
+AB.4's detectability check and AA.2/AE.1's IQR-clipping check). It does not
+run at step 4/5 — there is no rendered CSV to check yet, and the hard
+sequencing constraint (计划 7.3) forbids rendering before the script is
+frozen. Once MAEDA renders the final ``sales_data.csv``, this flag re-checks
+every event's ``data_signal`` against the real distribution: is it
+statistically detectable (z >= 3, or z >= 5 for ``unexplained`` events,
+附录 AB.4), and does its peak stay under the IQR upper bound that
+``handle_outliers`` would otherwise clip it at (附录 AA.2)? A failure here
+blocks step 6 — per 附录 AF.1, only *rendering* parameters (row count, noise
+coefficient, the ``units`` price-band generation) may be adjusted to fix it;
+the frozen script fields (segment, shape, magnitude, dates, wording) may not
+be silently loosened to pass.
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import json
+import math
 import re
+import statistics
 import sys
 from datetime import date
 from pathlib import Path
@@ -67,6 +85,15 @@ _MIN_PROBES_NORMAL_DISTRACTOR = 2
 _MAX_EVENTS_PER_REGION = 4
 _MIN_DISTINCT_MONTHS = 6
 _MIN_IMPLICIT_NORMAL_EVENTS = 3
+
+# Step-6 detectability gate (附录 AB.4 / AC.5 / AF.1) — only evaluated when
+# --data-path is given, never at step 4/5.
+_MIN_Z_DEFAULT = 3.0
+_MIN_Z_UNEXPLAINED = 5.0
+# 附录 AF.1/AF.2: mean of the "1±magnitude" time weight across the event
+# window. step = constant offset for the whole window (weight 1.0); ramp and
+# spike are triangular (linear-up or peak-at-midpoint), averaging to ~0.5.
+_SHAPE_MEAN_WEIGHT = {"step": 1.0, "ramp": 0.5, "spike": 0.5}
 
 
 def _parse_date(raw: str, field: str, event_id: str, errors: list[str]) -> date | None:
@@ -312,12 +339,134 @@ def _compute_manifest(data: dict, events: list[dict]) -> dict:
     }
 
 
+def _iqr_bounds(values: list[float]) -> tuple[float, float]:
+    """附录 AE.2's exact formula: linear-interpolated quantiles, matching both
+    pandas' ``Series.quantile()`` default and cleaner's ``_compute_bounds()``
+    (``mcp_server/tools/handle_outliers.py``, ``method="iqr"``). Must stay
+    byte-for-byte identical to AE.2, or this check could say "safe" while
+    cleaner's real IQR clipping disagrees.
+    """
+    s = sorted(values)
+
+    def quantile(p: float) -> float:
+        idx = p * (len(s) - 1)
+        lo, hi = int(idx), min(int(idx) + 1, len(s) - 1)
+        frac = idx - lo
+        return s[lo] + (s[hi] - s[lo]) * frac
+
+    q1, q3 = quantile(0.25), quantile(0.75)
+    iqr = q3 - q1
+    return q1 - 1.5 * iqr, q3 + 1.5 * iqr
+
+
+def _robust_rel_std(values: list[float]) -> float:
+    """Approximates 附录 AC.3's "quality-noise-stripped" rel_std without
+    access to a noise-free render: AC.3 found that generate_demo_data.py's
+    1%-of-rows x10 outlier injection, not the 20% per-row business noise,
+    dominates the raw sample std. An IQR-based robust std (IQR / 1.349, the
+    standard normal-equivalent scale) is insensitive to that ~1% contaminated
+    tail the same way trimming those rows out would be, so it stands in for
+    re-running the generator without its quality-noise path. If this
+    consistently over/under-shoots what AC.3's clean-vs-dirty comparison
+    would give on the actual final data, replace it with a real ablation
+    render instead of tightening this approximation further.
+    """
+    s = sorted(values)
+
+    def quantile(p: float) -> float:
+        idx = p * (len(s) - 1)
+        lo, hi = int(idx), min(int(idx) + 1, len(s) - 1)
+        frac = idx - lo
+        return s[lo] + (s[hi] - s[lo]) * frac
+
+    iqr = quantile(0.75) - quantile(0.25)
+    robust_std = iqr / 1.349
+    mean = statistics.fmean(values)
+    return robust_std / mean if mean else math.inf
+
+
+def _load_metric_rows(data_path: Path) -> list[dict[str, str]]:
+    with data_path.open(encoding="utf-8-sig", newline="") as f:
+        return list(csv.DictReader(f))
+
+
+def _segment_matches(row: dict[str, str], segment: dict[str, str]) -> bool:
+    return all(row.get(key) == value for key, value in segment.items())
+
+
+def _check_detectability_and_clipping(
+    events: list[dict], rows: list[dict[str, str]], errors: list[str]
+) -> None:
+    """X.7 step-6 gate: 附录 AB.4 (z >= 3 / z >= 5 for unexplained) merged
+    with 附录 AA.2/AE.1 (peak must stay under the whole-table IQR upper
+    bound). Both halves must use the *same* rendered CSV, per 附录 AC.6.
+    """
+    for event in events:
+        data_signal = event.get("data_signal")
+        if not data_signal:
+            continue  # distractor events carry no data_signal to check
+
+        event_id = event.get("event_id")
+        metric = data_signal.get("metric")
+        segment = data_signal.get("segment") or {}
+        shape = data_signal.get("shape")
+        magnitude = data_signal.get("magnitude")
+        try:
+            vf = date.fromisoformat(event.get("valid_from", ""))
+            vt = date.fromisoformat(event.get("valid_to", ""))
+        except ValueError as exc:
+            errors.append(f"{event_id}: invalid valid_from/valid_to for detectability check: {exc}")
+            continue
+
+        segment_rows = [r for r in rows if _segment_matches(r, segment)]
+        try:
+            segment_values = [float(r[metric]) for r in segment_rows]
+            all_values = [float(r[metric]) for r in rows]
+        except (KeyError, ValueError) as exc:
+            errors.append(f"{event_id}: could not read metric {metric!r} from --data-path: {exc}")
+            continue
+
+        window_rows = [r for r in segment_rows if vf <= date.fromisoformat(r["date"]) <= vt]
+        n = len(window_rows)
+
+        if not segment_values or n == 0:
+            errors.append(f"{event_id}: zero rows match segment {segment!r} / window in --data-path")
+            continue
+
+        rel_std = _robust_rel_std(segment_values)
+        weight = _SHAPE_MEAN_WEIGHT.get(shape, 0.5)
+        z = magnitude * weight * math.sqrt(n) / rel_std if rel_std else math.inf
+
+        threshold = _MIN_Z_UNEXPLAINED if event.get("event_type") == "unexplained" else _MIN_Z_DEFAULT
+        if z < threshold:
+            errors.append(
+                f"{event_id}: detectability z={z:.2f} < required {threshold} "
+                f"(n={n}, rel_std={rel_std:.3f}, shape={shape}, magnitude={magnitude})"
+            )
+
+        peak = statistics.fmean(float(r[metric]) for r in window_rows)
+        _, upper = _iqr_bounds(all_values)
+        if peak > upper:
+            errors.append(
+                f"{event_id}: window peak {peak:.1f} exceeds whole-table IQR upper bound "
+                f"{upper:.1f} — handle_outliers would clip this event's signal"
+            )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--write-manifest",
         action="store_true",
         help="Write event_script.manifest.json (X.7 step-5 freeze action only).",
+    )
+    parser.add_argument(
+        "--data-path",
+        type=Path,
+        default=None,
+        help="Path to a rendered sales_data.csv — runs the X.7 step-6 "
+        "detectability + IQR-clipping gate (附录 AF.1/AF.3). Omit for the "
+        "step 4/5 schema-only checks.",
     )
     args = parser.parse_args()
 
@@ -331,6 +480,10 @@ def main() -> int:
         _check_event(event, errors)
     _check_composition(events, errors)
     _check_splits(events, errors)
+
+    if args.data_path is not None:
+        rows = _load_metric_rows(args.data_path)
+        _check_detectability_and_clipping(events, rows, errors)
 
     if errors:
         print(f"FAIL — {len(errors)} issue(s):", file=sys.stderr)
