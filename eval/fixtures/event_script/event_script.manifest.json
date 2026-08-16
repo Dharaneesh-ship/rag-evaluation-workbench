@@ -1,0 +1,19 @@
+{
+  "schema_version": "1",
+  "script_version": "1",
+  "canonicalization": "json-sorted-keys-utf8",
+  "sha256": "f276374fc4310ba688963f2f99f9cbfc7a65d7067a1cd73419535eefec357ecc",
+  "frozen_at": "2026-08-16T23:46:46Z",
+  "git_tag": "event-script-v1",
+  "counts": {
+    "total": 12,
+    "normal": 7,
+    "distractor": 3,
+    "unexplained": 2
+  },
+  "split_counts": {
+    "dev": 7,
+    "test": 5,
+    "stress": 0
+  }
+}
