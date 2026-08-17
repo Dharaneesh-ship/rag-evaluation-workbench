@@ -394,6 +394,27 @@ def _segment_matches(row: dict[str, str], segment: dict[str, str]) -> bool:
     return all(row.get(key) == value for key, value in segment.items())
 
 
+def _numeric_metric_values(records: list[dict[str, str]], metric: str) -> list[float]:
+    """Read ``metric`` off each record, skipping blanks.
+
+    3% of ``revenue`` rows are deliberately blank — that's the quality-noise
+    missingness the generator injects by design (X-V3), not a rendering
+    defect (附录 AJ.2). A missing reading carries no information about
+    whether the business signal moved, so it should drop out of the sample
+    rather than crash the float() conversion or get miscounted as a 0.0.
+    """
+    values = []
+    for r in records:
+        raw = r.get(metric)
+        if raw is None or raw == "":
+            continue
+        try:
+            values.append(float(raw))
+        except ValueError:
+            continue
+    return values
+
+
 def _check_detectability_and_clipping(
     events: list[dict], rows: list[dict[str, str]], errors: list[str]
 ) -> None:
@@ -418,19 +439,20 @@ def _check_detectability_and_clipping(
             errors.append(f"{event_id}: invalid valid_from/valid_to for detectability check: {exc}")
             continue
 
-        segment_rows = [r for r in rows if _segment_matches(r, segment)]
-        try:
-            segment_values = [float(r[metric]) for r in segment_rows]
-            all_values = [float(r[metric]) for r in rows]
-        except (KeyError, ValueError) as exc:
-            errors.append(f"{event_id}: could not read metric {metric!r} from --data-path: {exc}")
+        if rows and metric not in rows[0]:
+            errors.append(f"{event_id}: metric {metric!r} is not a column in --data-path")
             continue
 
+        segment_rows = [r for r in rows if _segment_matches(r, segment)]
+        segment_values = _numeric_metric_values(segment_rows, metric)
+        all_values = _numeric_metric_values(rows, metric)
+
         window_rows = [r for r in segment_rows if vf <= date.fromisoformat(r["date"]) <= vt]
-        n = len(window_rows)
+        window_values = _numeric_metric_values(window_rows, metric)
+        n = len(window_values)
 
         if not segment_values or n == 0:
-            errors.append(f"{event_id}: zero rows match segment {segment!r} / window in --data-path")
+            errors.append(f"{event_id}: zero non-blank rows match segment {segment!r} / window in --data-path")
             continue
 
         rel_std = _robust_rel_std(segment_values)
@@ -444,7 +466,7 @@ def _check_detectability_and_clipping(
                 f"(n={n}, rel_std={rel_std:.3f}, shape={shape}, magnitude={magnitude})"
             )
 
-        peak = statistics.fmean(float(r[metric]) for r in window_rows)
+        peak = statistics.fmean(window_values)
         _, upper = _iqr_bounds(all_values)
         if peak > upper:
             errors.append(
