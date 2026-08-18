@@ -410,3 +410,20 @@ class TestTransportConfigFromEnv:
         ):
             server_module._run()
             mock_run.assert_called_once_with(transport="stdio")
+
+    def test_run_logs_server_default_retrieval_tier_at_startup(self, monkeypatch):
+        """附录 CI.3: the resolved server_default retrieval tier must be
+        made visible at process startup, not only inside each response's
+        echo field — this locks that _run() actually calls the logger,
+        not just that the function exists somewhere unused."""
+        monkeypatch.delenv("MCP_TRANSPORT", raising=False)
+        server_module = self._reload_server_module()
+        with (
+            patch.object(server_module, "_harden_stdio"),
+            patch.object(server_module.mcp, "run"),
+            patch(
+                "rag.app.mcp_server.retrieval_config.log_server_default_retrieval_tier"
+            ) as mock_log,
+        ):
+            server_module._run()
+            mock_log.assert_called_once_with()

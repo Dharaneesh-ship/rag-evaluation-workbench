@@ -98,7 +98,7 @@ def test_cli_ingest_nonexistent_file_fails():
 
 
 @pytest.mark.e2e
-def test_cli_query_returns_results(tmp_workspace, capsys):
+def test_cli_query_returns_results(tmp_workspace, capsys, monkeypatch):
     """Query CLI returns results (exit 0) after ingest."""
     db_path, index_dir, sample_txt = tmp_workspace
 
@@ -110,6 +110,20 @@ def test_cli_query_returns_results(tmp_workspace, capsys):
         "--token-budget", "256",
     ])
     assert rc == 0
+
+    # ingest_main() just called load_dotenv(override=False) internally,
+    # which (附录 CI.3/CH.2: RAG_EMBEDDING_PROVIDER_DEFAULT is now a live
+    # variable, no longer dead-named) may have pulled this machine's real
+    # ~/.env into os.environ for the rest of the process. rag.cli.query has
+    # no --embedding-provider override (unlike rag.cli.eval), so strip it
+    # back out before querying — this test only ever ingested BM25 (rag.
+    # cli.ingest has no embedding step) and is testing "does the plain
+    # ingest→query path work", not "which embedding provider happens to be
+    # configured on this machine". Without this, a real .env with
+    # RAG_EMBEDDING_PROVIDER_DEFAULT=openai would push this smoke test onto
+    # a vector-search path with no matching index (INDEX_NOT_FOUND).
+    monkeypatch.delenv("RAG_EMBEDDING_PROVIDER_DEFAULT", raising=False)
+    monkeypatch.delenv("RAG_RERANKER_PROVIDER_DEFAULT", raising=False)
 
     # Then query
     from rag.cli.query import main as query_main

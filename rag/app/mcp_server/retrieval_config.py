@@ -86,7 +86,38 @@ class ResolvedEmbedding:
 
 def _server_default_embedding_provider() -> Optional[str]:
     raw = os.environ.get("RAG_EMBEDDING_PROVIDER_DEFAULT", "none").strip().lower()
-    return None if raw in ("", "none") else raw
+    resolved = None if raw in ("", "none") else raw
+    if resolved is None:
+        # 附录 CI.3 (CH.2): this is the exact silent-degradation gap the
+        # audit found — RAG_EMBEDDING_PROVIDER_DEFAULT unset/"none" makes
+        # every "server_default" request resolve to BM25-only with no
+        # signal anywhere. Deliberately NOT fail-fast (unlike
+        # index_compat_mode's incompatible-index case): an unset default
+        # is a legitimate, tested deployment shape (offline/no-API-key dev
+        # and CI environments — see tests/test_retrieval_config.py's
+        # test_server_default_with_default_unset_is_bm25_only), not
+        # necessarily a misconfiguration. The response's echo field
+        # (RetrieveOutput.embedding_provider / retrieval_mode,
+        # server.py:595-602) already carries the real resolved tier for
+        # any caller that checks it (CI.3's MAEDA-side half); this log is
+        # the other half — a signal for whoever is watching the server
+        # process, not just whoever reads the response.
+        logger.warning(
+            "RAG_EMBEDDING_PROVIDER_DEFAULT is unset (or 'none') — "
+            "'server_default' embedding requests resolve to BM25-only "
+            "(no vector search). If this is unintentional, check for a "
+            "variable-name mismatch (the var must be exactly "
+            "RAG_EMBEDDING_PROVIDER_DEFAULT, not e.g. EMBEDDING_PROVIDER — "
+            "see 附录 CH.2/CI.1)."
+        )
+    else:
+        logger.info(
+            "RAG_EMBEDDING_PROVIDER_DEFAULT=%s — 'server_default' embedding "
+            "requests resolve to '%s'.",
+            raw,
+            resolved,
+        )
+    return resolved
 
 
 def resolve_embedding_config(
@@ -171,7 +202,26 @@ class ResolvedReranker:
 
 def _server_default_reranker_provider() -> Optional[str]:
     raw = os.environ.get("RAG_RERANKER_PROVIDER_DEFAULT", "none").strip().lower()
-    return None if raw in ("", "none") else raw
+    resolved = None if raw in ("", "none") else raw
+    if resolved is None:
+        # 附录 CI.3 (CH.2) — see the matching comment in
+        # _server_default_embedding_provider() for why this warns instead
+        # of failing fast.
+        logger.warning(
+            "RAG_RERANKER_PROVIDER_DEFAULT is unset (or 'none') — "
+            "'server_default' reranker requests resolve to no reranking. "
+            "If this is unintentional, check for a variable-name mismatch "
+            "(the var must be exactly RAG_RERANKER_PROVIDER_DEFAULT, not "
+            "e.g. RERANK_PROVIDER/RERANK_ENABLED — see 附录 CH.2/CI.1)."
+        )
+    else:
+        logger.info(
+            "RAG_RERANKER_PROVIDER_DEFAULT=%s — 'server_default' reranker "
+            "requests resolve to '%s'.",
+            raw,
+            resolved,
+        )
+    return resolved
 
 
 def resolve_reranker_config(
@@ -235,3 +285,42 @@ def build_reranker(resolved: ResolvedReranker):
         except Exception as exc:
             raise RerankerUnavailableError(str(exc)) from exc
     raise RerankerUnavailableError(f"Unknown reranker provider '{resolved.provider}'.")
+
+
+# ---------------------------------------------------------------------------
+# Startup-time visibility (附录 CI.3)
+# ---------------------------------------------------------------------------
+
+
+def log_server_default_retrieval_tier() -> None:
+    """Log the resolved ``server_default`` embedding/reranker tier once at startup.
+
+    附录 CI.3 requires a log "at startup/first retrieval" in addition to
+    the per-request echo field — this covers the startup half. Calling
+    :func:`_server_default_embedding_provider`/
+    :func:`_server_default_reranker_provider` here reuses the exact same
+    resolution + logging as every real request (no separate code path to
+    drift out of sync), so an operator watching the process come up sees
+    the same verdict a request would produce, before any client ever asks.
+
+    Call once from the process entry point (``server.py::_run()``), after
+    ``_harden_stdio()`` so the log actually lands on stderr where an
+    operator will see it, and before ``mcp.run()`` blocks.
+    """
+    embedding = _server_default_embedding_provider()
+    reranker = _server_default_reranker_provider()
+    if embedding is None and reranker is None:
+        logger.warning(
+            "Startup retrieval tier check: 'server_default' resolves to "
+            "BM25-only, no reranking. Every request that doesn't "
+            "explicitly override embedding_provider/reranker_provider "
+            "will run at this tier — see the two warnings above (or "
+            "README.md 'Configuration' table) if that's unexpected."
+        )
+    else:
+        logger.info(
+            "Startup retrieval tier check: 'server_default' resolves to "
+            "embedding_provider=%s reranker_provider=%s.",
+            embedding,
+            reranker,
+        )

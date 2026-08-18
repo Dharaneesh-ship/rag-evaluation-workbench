@@ -14,6 +14,37 @@ def pytest_configure(config: pytest.Config) -> None:
 
 # ── Shared fixtures ────────────────────────────────────────────────────────────
 
+@pytest.fixture(autouse=True)
+def _isolate_retrieval_config_env(monkeypatch):
+    """Prevent a developer's real ``.env`` from leaking retrieval-tier
+    config across test files for the rest of the pytest process.
+
+    附录 CI.3/CH.2: ``RAG_EMBEDDING_PROVIDER_DEFAULT``/
+    ``RAG_RERANKER_PROVIDER_DEFAULT`` used to sit in ``.env`` under dead
+    names (``EMBEDDING_PROVIDER``/``RERANK_PROVIDER``) that no code ever
+    read, so ``load_dotenv()`` picking up ``.env`` was a no-op for them.
+    Now that the names are fixed and these variables are actually wired up
+    (CH.2's fix), several tests (``tests/test_cli_ingest.py``, ``tests/
+    test_ingest_hardening.py``, ``tests/e2e/test_main_path.py``) exercise
+    ``rag.cli.ingest``'s ``load_dotenv(override=False)`` call, which writes
+    straight into ``os.environ`` with no teardown — so a real repo-local
+    ``.env`` with ``RAG_EMBEDDING_PROVIDER_DEFAULT=openai`` silently
+    flipped every *other* test module's assumed BM25-only
+    ``"server_default"`` for the remainder of the same pytest run,
+    depending on file-collection order. Individual tests that want a
+    specific value already set it explicitly via ``monkeypatch`` (see
+    ``tests/test_retrieval_config.py``); this fixture just guarantees every
+    test starts from a clean slate instead of whatever an unrelated
+    earlier test happened to load from disk.
+    """
+    for var in (
+        "RAG_EMBEDDING_PROVIDER_DEFAULT",
+        "RAG_RERANKER_PROVIDER_DEFAULT",
+        "RAG_INDEX_COMPAT_MODE",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+
 @pytest.fixture
 def sample_config() -> dict:
     """Return a minimal in-memory config dict suitable for unit tests.

@@ -11,6 +11,7 @@ from rag.app.mcp_server.retrieval_config import (
     build_embedding_provider,
     build_reranker,
     index_compat_mode,
+    log_server_default_retrieval_tier,
     resolve_embedding_config,
     resolve_reranker_config,
 )
@@ -176,3 +177,82 @@ class TestBuildReranker:
     def test_unknown_provider_raises_unavailable(self):
         with pytest.raises(RerankerUnavailableError):
             build_reranker(ResolvedReranker("not-a-real-reranker", "m"))
+
+
+# ---------------------------------------------------------------------------
+# 附录 CI.3 (CH.2) — silent server_default degradation must not be silent
+# ---------------------------------------------------------------------------
+#
+# CH.2 found that RAG_EMBEDDING_PROVIDER_DEFAULT/RAG_RERANKER_PROVIDER_DEFAULT
+# unset resolves every "server_default" request to BM25-only/no-rerank with
+# zero signal anywhere. CI.3's ruling: not fail-fast (an unset default is a
+# legitimate, already-tested deployment shape — see
+# test_server_default_with_default_unset_is_bm25_only above — not
+# necessarily a misconfiguration), but it must stop being *silent*: a log at
+# resolution time (these tests) plus the already-existing response echo
+# field (RetrieveOutput.embedding_provider/retrieval_mode, covered in
+# tests/test_mcp_server.py and tests/test_retrieve_tool.py).
+
+
+class TestServerDefaultResolutionIsLogged:
+    def test_embedding_default_unset_logs_a_warning(self, monkeypatch, caplog):
+        monkeypatch.delenv("RAG_EMBEDDING_PROVIDER_DEFAULT", raising=False)
+        with caplog.at_level("WARNING", logger="rag.app.mcp_server.retrieval_config"):
+            resolve_embedding_config("server_default", "m", 10)
+        assert any(
+            "RAG_EMBEDDING_PROVIDER_DEFAULT" in r.message and "BM25-only" in r.message
+            for r in caplog.records
+        )
+
+    def test_embedding_default_set_logs_info_not_warning(self, monkeypatch, caplog):
+        monkeypatch.setenv("RAG_EMBEDDING_PROVIDER_DEFAULT", "openai")
+        with caplog.at_level("INFO", logger="rag.app.mcp_server.retrieval_config"):
+            resolve_embedding_config("server_default", "m", 10)
+        assert not any(r.levelname == "WARNING" for r in caplog.records)
+        assert any("openai" in r.message for r in caplog.records)
+
+    def test_explicit_none_does_not_touch_server_default_logging(self, monkeypatch, caplog):
+        """Explicit embedding_provider='none' is a deliberate caller
+        choice, not the silent-default gap CI.3 is about — it must not go
+        through (and therefore not warn from) the server_default path."""
+        monkeypatch.delenv("RAG_EMBEDDING_PROVIDER_DEFAULT", raising=False)
+        with caplog.at_level("WARNING", logger="rag.app.mcp_server.retrieval_config"):
+            resolve_embedding_config("none", "m", 10)
+        assert caplog.records == []
+
+    def test_reranker_default_unset_logs_a_warning(self, monkeypatch, caplog):
+        monkeypatch.delenv("RAG_RERANKER_PROVIDER_DEFAULT", raising=False)
+        with caplog.at_level("WARNING", logger="rag.app.mcp_server.retrieval_config"):
+            resolve_reranker_config("server_default")
+        assert any(
+            "RAG_RERANKER_PROVIDER_DEFAULT" in r.message and "no reranking" in r.message
+            for r in caplog.records
+        )
+
+    def test_reranker_default_set_logs_info_not_warning(self, monkeypatch, caplog):
+        monkeypatch.setenv("RAG_RERANKER_PROVIDER_DEFAULT", "voyage")
+        with caplog.at_level("INFO", logger="rag.app.mcp_server.retrieval_config"):
+            resolve_reranker_config("server_default")
+        assert not any(r.levelname == "WARNING" for r in caplog.records)
+        assert any("voyage" in r.message for r in caplog.records)
+
+
+class TestLogServerDefaultRetrievalTier:
+    def test_both_unset_logs_one_combined_warning(self, monkeypatch, caplog):
+        monkeypatch.delenv("RAG_EMBEDDING_PROVIDER_DEFAULT", raising=False)
+        monkeypatch.delenv("RAG_RERANKER_PROVIDER_DEFAULT", raising=False)
+        with caplog.at_level("WARNING", logger="rag.app.mcp_server.retrieval_config"):
+            log_server_default_retrieval_tier()
+        assert any("BM25-only" in r.message for r in caplog.records)
+        assert any("Startup retrieval tier check" in r.message for r in caplog.records)
+
+    def test_both_configured_logs_info_summary_not_warning(self, monkeypatch, caplog):
+        monkeypatch.setenv("RAG_EMBEDDING_PROVIDER_DEFAULT", "openai")
+        monkeypatch.setenv("RAG_RERANKER_PROVIDER_DEFAULT", "voyage")
+        with caplog.at_level("INFO", logger="rag.app.mcp_server.retrieval_config"):
+            log_server_default_retrieval_tier()
+        startup_records = [r for r in caplog.records if "Startup retrieval tier check" in r.message]
+        assert len(startup_records) == 1
+        assert startup_records[0].levelname == "INFO"
+        assert "openai" in startup_records[0].message
+        assert "voyage" in startup_records[0].message

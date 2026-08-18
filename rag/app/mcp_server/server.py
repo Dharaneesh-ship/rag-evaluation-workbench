@@ -765,6 +765,13 @@ def _run() -> None:
     attached to its stdin/stdout to talk to.
     """
     _harden_stdio()
+    from rag.app.mcp_server.retrieval_config import log_server_default_retrieval_tier
+
+    # 附录 CI.3 (CH.2): make the resolved 'server_default' retrieval tier
+    # visible at process startup, not just inside each response's echo
+    # field — an operator watching the process come up should not have to
+    # send a request just to find out whether they're running BM25-only.
+    log_server_default_retrieval_tier()
     mcp.run(transport=os.environ.get("MCP_TRANSPORT", "stdio"))
 
 
