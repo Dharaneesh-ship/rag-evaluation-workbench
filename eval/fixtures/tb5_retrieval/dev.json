@@ -8,7 +8,8 @@
       "4a254e96eab972233d08f1d2c4f7bd4f50fd4c8a97736b1ab6a76770d2e0f833",
       "8b2f96db3a82d56c94d4900331628eec0ffb0c2f52a9d060b0b938fc3bcaa432"
     ],
-    "notes": "[normal] 南区线上渠道退款审核周期拉长,导致确认收入延迟"
+    "notes": "[normal] 南区线上渠道退款审核周期拉长,导致确认收入延迟",
+    "split": "dev"
   },
   {
     "query_id": "EVT-2023-03-SOUTH-ONLINE-POLICY#2",
@@ -19,7 +20,8 @@
       "4a254e96eab972233d08f1d2c4f7bd4f50fd4c8a97736b1ab6a76770d2e0f833",
       "8b2f96db3a82d56c94d4900331628eec0ffb0c2f52a9d060b0b938fc3bcaa432"
     ],
-    "notes": "[normal] 南区线上渠道退款审核周期拉长,导致确认收入延迟"
+    "notes": "[normal] 南区线上渠道退款审核周期拉长,导致确认收入延迟",
+    "split": "dev"
   },
   {
     "query_id": "EVT-2022-06-WEST-WIDGETB-LAUNCH#1",
@@ -30,7 +32,8 @@
       "80b77c9bf8e5af893900143d4d9cf763179d8cb3b38e8e7a208f4ebd8197ca28",
       "b21a8f18fd789379581537362dc2cb74f03b9a08cec8fbddff792018da06b8c6"
     ],
-    "notes": "[normal] 西区 Widget B 新品首发,首批渠道备货带动出货量"
+    "notes": "[normal] 西区 Widget B 新品首发,首批渠道备货带动出货量",
+    "split": "dev"
   },
   {
     "query_id": "EVT-2022-06-WEST-WIDGETB-LAUNCH#2",
@@ -41,7 +44,8 @@
       "80b77c9bf8e5af893900143d4d9cf763179d8cb3b38e8e7a208f4ebd8197ca28",
       "b21a8f18fd789379581537362dc2cb74f03b9a08cec8fbddff792018da06b8c6"
     ],
-    "notes": "[normal] 西区 Widget B 新品首发,首批渠道备货带动出货量"
+    "notes": "[normal] 西区 Widget B 新品首发,首批渠道备货带动出货量",
+    "split": "dev"
   },
   {
     "query_id": "EVT-2023-09-EAST-PARTNER-DISPUTE#1",
@@ -52,7 +56,8 @@
       "b5502f9a1c4eff9f982d1bc090089e26b0267446ed62422b5aaac13bab773106",
       "897bb84f1ecd81e916c6cc12e7ba81260f484dbc43b050ec262a2850a4e6fcfa"
     ],
-    "notes": "[normal] 华东合作伙伴渠道因结算纠纷暂停发货三周"
+    "notes": "[normal] 华东合作伙伴渠道因结算纠纷暂停发货三周",
+    "split": "dev"
   },
   {
     "query_id": "EVT-2023-09-EAST-PARTNER-DISPUTE#2",
@@ -63,7 +68,8 @@
       "b5502f9a1c4eff9f982d1bc090089e26b0267446ed62422b5aaac13bab773106",
       "897bb84f1ecd81e916c6cc12e7ba81260f484dbc43b050ec262a2850a4e6fcfa"
     ],
-    "notes": "[normal] 华东合作伙伴渠道因结算纠纷暂停发货三周"
+    "notes": "[normal] 华东合作伙伴渠道因结算纠纷暂停发货三周",
+    "split": "dev"
   },
   {
     "query_id": "EVT-2024-05-NORTH-GADGETPRO-EOL#1",
@@ -74,7 +80,8 @@
       "515016916c48a6465ef4ac5679627e0ca86e460cc94127597f9f52857fc06e34",
       "63c5282bee8f5906319c6205d50e45fa1aa9311ce1e1fe3db59148b2a5da87a2"
     ],
-    "notes": "[normal] 北区 Gadget Pro 停产清仓,收入明显回落"
+    "notes": "[normal] 北区 Gadget Pro 停产清仓,收入明显回落",
+    "split": "dev"
   },
   {
     "query_id": "EVT-2024-05-NORTH-GADGETPRO-EOL#2",
@@ -85,7 +92,8 @@
       "515016916c48a6465ef4ac5679627e0ca86e460cc94127597f9f52857fc06e34",
       "63c5282bee8f5906319c6205d50e45fa1aa9311ce1e1fe3db59148b2a5da87a2"
     ],
-    "notes": "[normal] 北区 Gadget Pro 停产清仓,收入明显回落"
+    "notes": "[normal] 北区 Gadget Pro 停产清仓,收入明显回落",
+    "split": "dev"
   },
   {
     "query_id": "EVT-2023-04-SOUTH-DISCOUNT-CAMPAIGN#1",
@@ -95,7 +103,8 @@
       "d2f18b1bc090a907e552689b0d1bbc5db895a7c7cfe81384500f758b5e87f2c5",
       "a378c392bff9c76d1f3cfbe1e3a266b5aaa1f35e4f12fa45c989fcb3456a968c"
     ],
-    "notes": "[distractor] 南区四月上线满减促销,但活动效果未达预期,籍此未观察到收入端的明显提升"
+    "notes": "[distractor] 南区四月上线满减促销,但活动效果未达预期,籍此未观察到收入端的明显提升",
+    "split": "dev"
   },
   {
     "query_id": "EVT-2023-04-SOUTH-DISCOUNT-CAMPAIGN#2",
@@ -105,7 +114,8 @@
       "d2f18b1bc090a907e552689b0d1bbc5db895a7c7cfe81384500f758b5e87f2c5",
       "a378c392bff9c76d1f3cfbe1e3a266b5aaa1f35e4f12fa45c989fcb3456a968c"
     ],
-    "notes": "[distractor] 南区四月上线满减促销,但活动效果未达预期,籍此未观察到收入端的明显提升"
+    "notes": "[distractor] 南区四月上线满减促销,但活动效果未达预期,籍此未观察到收入端的明显提升",
+    "split": "dev"
   },
   {
     "query_id": "EVT-2024-08-CENTRAL-PRICE-REVIEW#1",
@@ -114,7 +124,8 @@
     "expected_sources": [
       "42c31129071ae42c566fc5783b2e2165acf4b45331426dcd4a1b5b9bd74c60e7"
     ],
-    "notes": "[distractor] 中区八月启动了一轮定价评审,讨论是否上调部分型号价格,最终未执行调价"
+    "notes": "[distractor] 中区八月启动了一轮定价评审,讨论是否上调部分型号价格,最终未执行调价",
+    "split": "dev"
   },
   {
     "query_id": "EVT-2024-08-CENTRAL-PRICE-REVIEW#2",
@@ -123,6 +134,7 @@
     "expected_sources": [
       "42c31129071ae42c566fc5783b2e2165acf4b45331426dcd4a1b5b9bd74c60e7"
     ],
-    "notes": "[distractor] 中区八月启动了一轮定价评审,讨论是否上调部分型号价格,最终未执行调价"
+    "notes": "[distractor] 中区八月启动了一轮定价评审,讨论是否上调部分型号价格,最终未执行调价",
+    "split": "dev"
   }
 ]

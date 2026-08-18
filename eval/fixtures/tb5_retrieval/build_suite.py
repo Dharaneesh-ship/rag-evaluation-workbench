@@ -94,6 +94,16 @@ def main() -> int:
                     "notes": (
                         f"[{event['event_type']}] {event['business_description']}"
                     ),
+                    # 附录 CI.4: self-declaring split marker, checked by
+                    # rag.cli.eval's reveal guard (rag/cli/eval.py
+                    # _filter_by_split / _warn_if_test_split_involved)
+                    # regardless of which path/filename loaded this entry —
+                    # unlike a filename-based check, this survives copies,
+                    # renames, or a --suite-file pointed straight at
+                    # test.json. Previously this file's only "don't touch
+                    # me casually" protection was a docstring comment; see
+                    # CH.6/CI.4 for why that's zero mechanism, not a typo.
+                    "split": split,
                 }
             )
 

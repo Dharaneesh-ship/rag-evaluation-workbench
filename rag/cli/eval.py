@@ -105,6 +105,24 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=["server_default", "none", "crossencoder", "voyage"],
         help="Reranker provider for retrieval. Defaults to 'server_default'.",
     )
+    parser.add_argument(
+        "--split",
+        choices=["dev", "test", "all"],
+        default="dev",
+        help="附录 CI.4 (rag-side counterpart of MAEDA's 附录 CC.1 "
+             "measure_noise.py --split fix): filters loaded suite entries "
+             "by their self-declared 'split' field (written by "
+             "eval/fixtures/tb5_retrieval/build_suite.py). Defaults to "
+             "'dev' -- entries with split=='test' (eval/fixtures/"
+             "tb5_retrieval/test.json is FROZEN for the one-time A/B "
+             "reveal, 硬约束 1) are excluded no matter how the suite was "
+             "selected, including --suite-file pointed straight at "
+             "test.json -- the filter runs on loaded entry content, not "
+             "on the filename. 'test'/'all' must be requested explicitly "
+             "and print an unmissable warning naming every test-split "
+             "query id about to run. Suites without a 'split' field "
+             "(example_queries, failure_cases) are unaffected.",
+    )
     return parser
 
 
@@ -147,6 +165,78 @@ def _load_suite(path: Path) -> list[dict]:
     if path.suffix == ".jsonl":
         return [json.loads(line) for line in text.splitlines() if line.strip()]
     return json.loads(text)
+
+
+# ---------------------------------------------------------------------------
+# Split-aware case selection (附录 CI.4) — the test-split reveal guard
+# ---------------------------------------------------------------------------
+#
+# 附录 CH.6/CI.4: before this existed, eval/fixtures/tb5_retrieval/test.json
+# was a plain, unprotected JSON file — `rag.cli.eval --suite-file
+# .../test.json` could be run by anyone/any agent with zero warning and zero
+# refusal, the only "protection" being a docstring sentence in
+# build_suite.py ("FROZEN — only run at the final A/B reveal") that no code
+# path ever checked. That is structurally the same gap 附录 CC.1 found and
+# fixed in MAEDA's scripts/measure_noise.py (--split, default dev). This
+# mirrors that fix, but keyed off each entry's own 'split' field (added by
+# build_suite.py, 附录 CI.4) rather than off a filename/path guess — a
+# content-based check survives copies, renames, or a --suite-file argument
+# aimed straight at test.json, which is exactly the "bypass the split
+# selector, name the file/cases directly" path CI.4 requires covering (see
+# MAEDA's test_warns_even_for_explicit_cases_that_happen_to_include_test).
+
+
+def filter_by_split(entries: list[dict], split: str) -> list[dict]:
+    """Filter suite entries by their self-declared ``split`` field.
+
+    Entries produced by non-TB5 fixtures (``example_queries.json``,
+    ``failure_cases.json``) have no ``split`` field at all and are never
+    treated as test-split, so this filter is a no-op for them regardless of
+    the requested split — only ``eval/fixtures/tb5_retrieval/{dev,test}.json``
+    carry the marker.
+
+    Args:
+        entries: Suite entries as loaded from JSON/JSONL.
+        split: ``"dev"`` (default) excludes every ``split == "test"`` entry;
+            ``"test"`` keeps only ``split == "test"`` entries; ``"all"``
+            returns everything unfiltered.
+
+    Returns:
+        The filtered entry list. Order is preserved.
+    """
+    if split == "all":
+        return list(entries)
+    if split == "test":
+        return [e for e in entries if e.get("split") == "test"]
+    return [e for e in entries if e.get("split") != "test"]
+
+
+def warn_if_test_split_involved(selected: list[dict]) -> None:
+    """Print an unmissable warning banner if any selected entry is test-split.
+
+    Fires off the actually-selected set, not off which ``--split`` value
+    was passed — so an explicit ``--suite-file`` pointed at a file that
+    happens to contain test-marked entries is flagged exactly the same as
+    ``--split test``/``--split all`` (附录 CI.4's bypass-coverage
+    requirement). Printed to stdout, not just logged, per 硬约束 1: the
+    test split gets exactly ONE official reveal, and this is the last
+    point before a real eval run actually executes where a human is still
+    watching the terminal it was launched from.
+
+    Args:
+        selected: The entries about to actually be evaluated (post-filter).
+    """
+    test_ids = sorted(e.get("query_id", e.get("query", "?")) for e in selected if e.get("split") == "test")
+    if not test_ids:
+        return
+    print("\n" + "!" * 78)
+    print("!! WARNING: this eval run includes TEST-SPLIT queries (TB5 retrieval-layer eval).")
+    print("!! 硬约束 1: test split gets exactly ONE official reveal --")
+    print("!! if this is that reveal, make sure it's the real predetermined")
+    print("!! run, not routine dev-split tuning or exploration.")
+    print(f"!! {len(test_ids)} test-split quer(ies): {test_ids}")
+    print("!! Routine tuning should use --split dev (the default) instead.")
+    print("!" * 78 + "\n")
 
 
 # ---------------------------------------------------------------------------
@@ -346,16 +436,29 @@ def main(argv: list[str] | None = None) -> int:
 
     # Load suite
     try:
-        entries = _load_suite(suite_path)
+        raw_entries = _load_suite(suite_path)
     except Exception as exc:
         print(f"Error: failed to load suite '{suite_path}': {exc}", file=sys.stderr)
         return 1
 
-    if not entries:
+    if not raw_entries:
         print("Warning: suite is empty — nothing to evaluate.")
         return 0
 
-    print(f"Evaluating suite '{args.suite}' — {len(entries)} case(s)  [k={args.k}]")
+    # 附录 CI.4: exclude/gate test-split entries before anything runs.
+    entries = filter_by_split(raw_entries, args.split)
+    warn_if_test_split_involved(entries)
+
+    if not entries:
+        print(
+            f"Warning: all {len(raw_entries)} case(s) in this suite are "
+            f"test-split (附录 CI.4) and --split is '{args.split}' — "
+            "nothing to evaluate. Pass --split test (or --split all) only "
+            "if this is the intended, one-time test-split reveal (硬约束 1)."
+        )
+        return 0
+
+    print(f"Evaluating suite '{args.suite}' — {len(entries)} case(s)  [k={args.k}, split={args.split}]")
 
     # Resolve DB and index paths
     db_path: Path = args.db if args.db else Path("data") / "default.db"

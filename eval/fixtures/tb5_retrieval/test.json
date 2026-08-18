@@ -8,7 +8,8 @@
       "28ab84c7825ba850ba8cd0fcae0bf79cf5aaea7e7d8a0a5ded73f4ffc4882579",
       "b8ffaf56dc964130eb5d8b293f78dfbc96a503a423eb711dfbb02423b9f9bcf4"
     ],
-    "notes": "[normal] 华东区主力型号断货,持续到八月中旬补货"
+    "notes": "[normal] 华东区主力型号断货,持续到八月中旬补货",
+    "split": "test"
   },
   {
     "query_id": "EVT-2023-07-EAST-STOCKOUT#2",
@@ -19,7 +20,8 @@
       "28ab84c7825ba850ba8cd0fcae0bf79cf5aaea7e7d8a0a5ded73f4ffc4882579",
       "b8ffaf56dc964130eb5d8b293f78dfbc96a503a423eb711dfbb02423b9f9bcf4"
     ],
-    "notes": "[normal] 华东区主力型号断货,持续到八月中旬补货"
+    "notes": "[normal] 华东区主力型号断货,持续到八月中旬补货",
+    "split": "test"
   },
   {
     "query_id": "EVT-2022-11-NORTH-PROMO#1",
@@ -29,7 +31,8 @@
       "d5ad4ebeecccaac613fd9fbc06e303b05e929d035d0011bf56c08ea07f0e371e",
       "4772857663218adfa01bf294ea81a01267ae202302cfa04e03c495fbfdbdbeab"
     ],
-    "notes": "[normal] 北区双十一大促,Widget A 收入大幅拉升"
+    "notes": "[normal] 北区双十一大促,Widget A 收入大幅拉升",
+    "split": "test"
   },
   {
     "query_id": "EVT-2022-11-NORTH-PROMO#2",
@@ -39,7 +42,8 @@
       "d5ad4ebeecccaac613fd9fbc06e303b05e929d035d0011bf56c08ea07f0e371e",
       "4772857663218adfa01bf294ea81a01267ae202302cfa04e03c495fbfdbdbeab"
     ],
-    "notes": "[normal] 北区双十一大促,Widget A 收入大幅拉升"
+    "notes": "[normal] 北区双十一大促,Widget A 收入大幅拉升",
+    "split": "test"
   },
   {
     "query_id": "EVT-2024-01-CENTRAL-RETURN-POLICY#1",
@@ -51,7 +55,8 @@
       "b02ddd4f1ea83941e98457644f828d6b00ae9b1cac6fc5b8cfe0bb286ad71f19",
       "731b31bdc6b8596bec1ec004c3de7c3a4478f657514f75dfdbfdfaf9c0ba9166"
     ],
-    "notes": "[normal] 中区调整退货政策,部分老客户流失导致收入走低"
+    "notes": "[normal] 中区调整退货政策,部分老客户流失导致收入走低",
+    "split": "test"
   },
   {
     "query_id": "EVT-2024-01-CENTRAL-RETURN-POLICY#2",
@@ -63,7 +68,8 @@
       "b02ddd4f1ea83941e98457644f828d6b00ae9b1cac6fc5b8cfe0bb286ad71f19",
       "731b31bdc6b8596bec1ec004c3de7c3a4478f657514f75dfdbfdfaf9c0ba9166"
     ],
-    "notes": "[normal] 中区调整退货政策,部分老客户流失导致收入走低"
+    "notes": "[normal] 中区调整退货政策,部分老客户流失导致收入走低",
+    "split": "test"
   },
   {
     "query_id": "EVT-2023-12-WEST-WAREHOUSE-MOVE#1",
@@ -73,7 +79,8 @@
       "ea83dad2fed5e0790a0a87ae9744ac9362c6f67adf1996efeb468e7c6b500fa1",
       "d12a449e55000c52710e025c616bc57e9ff4b3bff372a5398dc06c39103174cf"
     ],
-    "notes": "[distractor] 西区仓库十二月完成搬迁,团队担心会影响发货时效,但实际未造成收入波动"
+    "notes": "[distractor] 西区仓库十二月完成搬迁,团队担心会影响发货时效,但实际未造成收入波动",
+    "split": "test"
   },
   {
     "query_id": "EVT-2023-12-WEST-WAREHOUSE-MOVE#2",
@@ -83,6 +90,7 @@
       "ea83dad2fed5e0790a0a87ae9744ac9362c6f67adf1996efeb468e7c6b500fa1",
       "d12a449e55000c52710e025c616bc57e9ff4b3bff372a5398dc06c39103174cf"
     ],
-    "notes": "[distractor] 西区仓库十二月完成搬迁,团队担心会影响发货时效,但实际未造成收入波动"
+    "notes": "[distractor] 西区仓库十二月完成搬迁,团队担心会影响发货时效,但实际未造成收入波动",
+    "split": "test"
   }
 ]
