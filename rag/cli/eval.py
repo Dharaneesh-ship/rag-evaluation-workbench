@@ -11,11 +11,19 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import sys
 import time
 from pathlib import Path
 from typing import Any
+
+from rag.eval.split_guard import (
+    assert_not_test_probe_query,
+    declare_test_split_reveal,
+    filter_by_split,
+    warn_if_test_split_involved,
+)
 
 # Default location for built-in eval suites.
 _DEFAULT_SUITE_DIR = Path(__file__).parent.parent.parent / "tests" / "fixtures"
@@ -168,75 +176,20 @@ def _load_suite(path: Path) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Split-aware case selection (附录 CI.4) — the test-split reveal guard
+# Split-aware case selection (附录 CI.4 / CP.4)
 # ---------------------------------------------------------------------------
 #
-# 附录 CH.6/CI.4: before this existed, eval/fixtures/tb5_retrieval/test.json
-# was a plain, unprotected JSON file — `rag.cli.eval --suite-file
-# .../test.json` could be run by anyone/any agent with zero warning and zero
-# refusal, the only "protection" being a docstring sentence in
-# build_suite.py ("FROZEN — only run at the final A/B reveal") that no code
-# path ever checked. That is structurally the same gap 附录 CC.1 found and
-# fixed in MAEDA's scripts/measure_noise.py (--split, default dev). This
-# mirrors that fix, but keyed off each entry's own 'split' field (added by
-# build_suite.py, 附录 CI.4) rather than off a filename/path guess — a
-# content-based check survives copies, renames, or a --suite-file argument
-# aimed straight at test.json, which is exactly the "bypass the split
-# selector, name the file/cases directly" path CI.4 requires covering (see
-# MAEDA's test_warns_even_for_explicit_cases_that_happen_to_include_test).
+# These two functions used to be *defined* here, and 附录 CP.4 showed what
+# that cost: a repo-wide grep found `filter_by_split` called from exactly one
+# place, this file, while the probe scripts of 附录 CJ.3 and 附录 CO read the
+# frozen event script directly and never came near it. The guard is now a
+# shared mechanism in `rag.eval.split_guard`, with the check that actually
+# fails closed sitting at execution (`QueryPipeline.query`) rather than at any
+# one entry point. They are re-exported here unchanged, because
+# `rag.cli.eval.filter_by_split` is the name the CI.4 tests and prior
+# appendices refer to.
 
-
-def filter_by_split(entries: list[dict], split: str) -> list[dict]:
-    """Filter suite entries by their self-declared ``split`` field.
-
-    Entries produced by non-TB5 fixtures (``example_queries.json``,
-    ``failure_cases.json``) have no ``split`` field at all and are never
-    treated as test-split, so this filter is a no-op for them regardless of
-    the requested split — only ``eval/fixtures/tb5_retrieval/{dev,test}.json``
-    carry the marker.
-
-    Args:
-        entries: Suite entries as loaded from JSON/JSONL.
-        split: ``"dev"`` (default) excludes every ``split == "test"`` entry;
-            ``"test"`` keeps only ``split == "test"`` entries; ``"all"``
-            returns everything unfiltered.
-
-    Returns:
-        The filtered entry list. Order is preserved.
-    """
-    if split == "all":
-        return list(entries)
-    if split == "test":
-        return [e for e in entries if e.get("split") == "test"]
-    return [e for e in entries if e.get("split") != "test"]
-
-
-def warn_if_test_split_involved(selected: list[dict]) -> None:
-    """Print an unmissable warning banner if any selected entry is test-split.
-
-    Fires off the actually-selected set, not off which ``--split`` value
-    was passed — so an explicit ``--suite-file`` pointed at a file that
-    happens to contain test-marked entries is flagged exactly the same as
-    ``--split test``/``--split all`` (附录 CI.4's bypass-coverage
-    requirement). Printed to stdout, not just logged, per 硬约束 1: the
-    test split gets exactly ONE official reveal, and this is the last
-    point before a real eval run actually executes where a human is still
-    watching the terminal it was launched from.
-
-    Args:
-        selected: The entries about to actually be evaluated (post-filter).
-    """
-    test_ids = sorted(e.get("query_id", e.get("query", "?")) for e in selected if e.get("split") == "test")
-    if not test_ids:
-        return
-    print("\n" + "!" * 78)
-    print("!! WARNING: this eval run includes TEST-SPLIT queries (TB5 retrieval-layer eval).")
-    print("!! 硬约束 1: test split gets exactly ONE official reveal --")
-    print("!! if this is that reveal, make sure it's the real predetermined")
-    print("!! run, not routine dev-split tuning or exploration.")
-    print(f"!! {len(test_ids)} test-split quer(ies): {test_ids}")
-    print("!! Routine tuning should use --split dev (the default) instead.")
-    print("!" * 78 + "\n")
+__all__ = ["main", "filter_by_split", "warn_if_test_split_involved"]
 
 
 # ---------------------------------------------------------------------------
@@ -269,6 +222,15 @@ def _run_queries(
     Returns:
         List of result dicts suitable for ``run_eval()``.
     """
+    # 附录 CP.4: same content-based check QueryPipeline.query() enforces, run
+    # once over the whole batch before any index is loaded or any embedding
+    # provider is constructed. Redundant by design — this one only makes the
+    # refusal cheap and early; the one that closes the hole is downstream and
+    # cannot be routed around.
+    assert_not_test_probe_query(
+        [e.get("query", "") for e in entries], context="rag.cli.eval._run_queries"
+    )
+
     from rag.app.mcp_server.wiring import build_query_pipeline
 
     pipeline = build_query_pipeline(
@@ -472,16 +434,32 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
+    # 附录 CP.4: `--split test`/`--split all` with test entries actually
+    # selected IS the sanctioned reveal path — the operator typed the
+    # non-default value and read the CI.4 banner above. Declare it explicitly
+    # so the execution-time guard lets these through; every *other* way of
+    # reaching a test-split probe query stays closed.
+    has_test = any(e.get("split") == "test" for e in entries)
+    reveal: Any = (
+        declare_test_split_reveal(
+            f"rag.cli.eval --split {args.split} over {suite_path} "
+            f"({sum(1 for e in entries if e.get('split') == 'test')} test-split case(s))"
+        )
+        if has_test
+        else contextlib.nullcontext()
+    )
+
     # Run queries
     try:
-        results = _run_queries(
-            entries,
-            db_path,
-            index_dir,
-            top_k=args.top_k,
-            embedding_provider=args.embedding_provider,
-            reranker_provider=args.reranker_provider,
-        )
+        with reveal:
+            results = _run_queries(
+                entries,
+                db_path,
+                index_dir,
+                top_k=args.top_k,
+                embedding_provider=args.embedding_provider,
+                reranker_provider=args.reranker_provider,
+            )
     except Exception as exc:
         print(f"Error: unexpected failure during query execution: {exc}", file=sys.stderr)
         return 1

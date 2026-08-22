@@ -34,13 +34,22 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import sys
 from collections import defaultdict
 from pathlib import Path
 
-import yaml
-
 _ROOT = Path(__file__).parent.parent.parent.parent
-_EVENT_SCRIPT = _ROOT / "eval" / "fixtures" / "event_script" / "event_script.yaml"
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+# 附录 CP.4: this script used to `yaml.safe_load` the frozen event script
+# itself. It no longer does — every in-repository reader of that file goes
+# through rag.eval.split_guard, which is what makes "read the event script"
+# a single, greppable, testable act instead of a habit each caller re-invents
+# (tests/test_split_guard.py enforces that there is no second reader).
+# Building both suites legitimately needs every split, so it declares that.
+from rag.eval.split_guard import load_event_script_document  # noqa: E402
+
 _DB_PATH = _ROOT / "data" / "tb5.db"
 _OUT_DIR = Path(__file__).parent
 
@@ -66,7 +75,9 @@ def _load_chunk_ids_by_event() -> dict[str, list[str]]:
 
 
 def main() -> int:
-    data = yaml.safe_load(_EVENT_SCRIPT.read_text(encoding="utf-8"))
+    data = load_event_script_document(
+        reason="build_suite.py writes both dev.json and test.json — needs every split"
+    )
     events = data["events"]
     chunk_ids_by_event = _load_chunk_ids_by_event()
 

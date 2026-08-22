@@ -99,22 +99,33 @@ def test_entries_without_split_field_pass_through_as_non_test():
 
 
 def test_warns_when_test_split_selected(capsys):
+    """附录 CZ: the banner moved from stdout to stderr when the guard moved
+    into the shared ``rag/`` package (``rag.eval.split_guard._emit_banner``).
+    A human at a terminal sees stderr exactly as they saw stdout, so 硬约束 1
+    is unaffected; the MCP stdio JSON-RPC stream is now untouched by
+    construction. Asserting ``out == ""`` here makes stdout-cleanliness a
+    *behavioural* property of the guard, not only an AST rule in
+    tests/test_mcp_stdio_safety.py."""
     warn_if_test_split_involved([{"query_id": "T1", "split": "test"}])
-    out = capsys.readouterr().out
-    assert "WARNING" in out
-    assert "TEST-SPLIT" in out
-    assert "T1" in out
+    captured = capsys.readouterr()
+    assert "WARNING" in captured.err
+    assert "TEST-SPLIT" in captured.err
+    assert "T1" in captured.err
+    assert captured.out == ""
 
 
 def test_no_warning_when_only_dev_selected(capsys):
     warn_if_test_split_involved([{"query_id": "D1", "split": "dev"}])
-    out = capsys.readouterr().out
-    assert out == ""
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
 
 
 def test_no_warning_for_entries_without_split_field(capsys):
     warn_if_test_split_involved([{"query_id": "X1"}])
-    assert capsys.readouterr().out == ""
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
 
 
 # ---------------------------------------------------------------------------
@@ -188,9 +199,13 @@ def test_main_explicit_split_test_warns_and_does_not_silently_run(tmp_path, caps
 
     assert rc == 0
     captured = capsys.readouterr()
-    assert "WARNING" in captured.out
-    assert "TEST-SPLIT" in captured.out
-    assert "T1" in captured.out
+    # 附录 CZ: banner on stderr, results on stdout. Both land on the same
+    # terminal for the human this warning is for; only the JSON-RPC stream
+    # of an MCP process can tell them apart, which is the point.
+    assert "WARNING" in captured.err
+    assert "TEST-SPLIT" in captured.err
+    assert "T1" in captured.err
+    assert "WARNING" not in captured.out
 
 
 def test_main_default_split_on_mixed_suite_only_evaluates_dev(tmp_path, capsys):

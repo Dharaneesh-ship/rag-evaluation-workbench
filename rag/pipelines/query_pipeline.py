@@ -24,6 +24,7 @@ from rag.core.interfaces.keyword_index import BaseKeywordIndex
 from rag.core.interfaces.reranker import BaseReranker
 from rag.core.interfaces.trace_store import BaseTraceStore
 from rag.core.interfaces.vector_index import BaseVectorIndex
+from rag.eval.split_guard import assert_not_test_probe_query
 from rag.infra.indexes.rrf_fusion import RRFFusion
 
 logger = logging.getLogger(__name__)
@@ -291,7 +292,22 @@ class QueryPipeline:
 
         Returns:
             QueryResult with ranked candidates, citations, and run metadata.
+
+        Raises:
+            TestSplitRevealError: If ``query`` is one of the frozen TB5
+                test-split probe queries and this process has not declared a
+                reveal. 附录 CP.4: the split guard lives here, at the one
+                funnel every retrieval in this repository passes through
+                (CLI eval, the MCP retrieve tools, rag.cli.query, and any
+                ad-hoc probe script that imports any of them), precisely
+                because a guard mounted on a single entry point is the thing
+                that failed in 附录 CO.0. Yes, this couples the pipeline to an
+                eval fixture; the check is a hash-set lookup, degrades to a
+                no-op wherever that fixture is not shipped, and buys an
+                invariant no entry-point-local check can.
         """
+        assert_not_test_probe_query(query, context="QueryPipeline.query")
+
         start = time.monotonic()
         run_id = self._trace_store.save_run(
             run_type="query",

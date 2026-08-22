@@ -47,10 +47,19 @@ import sys
 from datetime import date
 from pathlib import Path
 
-import yaml
-
 _HERE = Path(__file__).parent
-_YAML_PATH = _HERE / "event_script.yaml"
+_ROOT = _HERE.parent.parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+# 附录 CP.4: verify.py used to read event_script.yaml itself. It now goes
+# through the one sanctioned reader, rag.eval.split_guard, like every other
+# in-repository consumer — verifying the frozen script legitimately needs
+# every split (the manifest hash is over the whole document), so it declares
+# that rather than quietly helping itself. tests/test_split_guard.py fails if
+# a second direct reader ever appears.
+from rag.eval.split_guard import load_event_script_source  # noqa: E402
+
 _MANIFEST_PATH = _HERE / "event_script.manifest.json"
 
 _EVENT_ID_RE = re.compile(r"^EVT-[A-Z0-9-]{4,48}$")
@@ -492,8 +501,9 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    text = _YAML_PATH.read_text(encoding="utf-8")
-    data = yaml.safe_load(text)
+    text, data = load_event_script_source(
+        reason="verify.py structural/manifest verification of the frozen script"
+    )
     events = data.get("events", [])
 
     errors: list[str] = []
