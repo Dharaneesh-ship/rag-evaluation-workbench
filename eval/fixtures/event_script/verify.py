@@ -638,6 +638,17 @@ def _run_v2(args, text: str, data: dict) -> int:
     print(json.dumps(manifest, indent=2, ensure_ascii=False))
     if notes:
         print(json.dumps(notes, indent=2))
+    if args.freeze:
+        from datetime import datetime, timezone
+
+        manifest["frozen_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        manifest["git_tag"] = "event-script-v2"
+        _MANIFEST_PATH.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        print(f"Wrote {_MANIFEST_PATH}")
+        old = json.loads(_RECEIPT_PATH.read_text(encoding="utf-8"))
+        old.update({"status": "frozen", "frozen_at": manifest["frozen_at"], "git_tag": "event-script-v2"})
+        _RECEIPT_PATH.write_text(json.dumps(old, indent=2) + "\n", encoding="utf-8")
+        print(f"Wrote {_RECEIPT_PATH}")
     if args.write_receipt:
         old = json.loads(_RECEIPT_PATH.read_text(encoding="utf-8")) if _RECEIPT_PATH.is_file() else {}
         receipt = {
@@ -702,6 +713,8 @@ def main() -> int:
                         help="v2: check the public file alone (no sealed file on this machine).")
     parser.add_argument("--write-receipt", action="store_true",
                         help="v2: write eval/sealed/RECEIPT.json (hashes only).")
+    parser.add_argument("--freeze", action="store_true",
+                        help="v2: write event_script.manifest.json (hash chain) and mark RECEIPT.json frozen.")
     parser.add_argument("--write-digests", action="store_true",
                         help="v2: write the hash-only test probe digest list.")
     args = parser.parse_args()

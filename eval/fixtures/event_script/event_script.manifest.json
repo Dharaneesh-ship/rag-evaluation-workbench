@@ -1,19 +1,25 @@
 {
   "schema_version": "1",
-  "script_version": "1",
+  "script_version": "2",
   "canonicalization": "json-sorted-keys-utf8",
-  "sha256": "f276374fc4310ba688963f2f99f9cbfc7a65d7067a1cd73419535eefec357ecc",
-  "frozen_at": "2026-08-16T23:46:46Z",
-  "git_tag": "event-script-v1",
+  "sha256": "46e7f23b489e35961af33317046e073e2740b5fff9608520acce6565948f3083",
+  "public_sha256": "46e7f23b489e35961af33317046e073e2740b5fff9608520acce6565948f3083",
+  "sealed_sha256": "4d3eae4096a165cb763cfe614b70059233fa5ec2085ac3cc42b0767d1ed0ad9a",
+  "combined_sha256": "efc9e5acabf3a636321add28b4dc600eadc39d227aa10cadf5dc81219a97db9e",
+  "slot_plan_sha256": "359eb5ed04a9730a570dc491f2e5ed2b8f7027f046eb9cd5cc0e13eaee73dfd5",
+  "v1_tag": "event-script-v1",
+  "frozen_at": "2026-11-05T04:17:23Z",
+  "git_tag": "event-script-v2",
   "counts": {
-    "total": 12,
-    "normal": 7,
+    "total": 30,
+    "normal": 25,
     "distractor": 3,
     "unexplained": 2
   },
   "split_counts": {
-    "dev": 7,
-    "test": 5,
+    "dev": 13,
+    "test": 17,
     "stress": 0
-  }
+  },
+  "h2_pool_test_normal": 12
 }

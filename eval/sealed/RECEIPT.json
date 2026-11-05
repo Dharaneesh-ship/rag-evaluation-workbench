@@ -1,5 +1,5 @@
 {
-  "status": "pre-freeze",
+  "status": "frozen",
   "superseded_slot_plans": [
     {
       "sha256": "84743e2507168f03adef5d3177ca9e0bdc0d8765451523c4c0123fbfe35eb02a",
@@ -15,5 +15,7 @@
   "counts": {
     "v2_dev": 6,
     "v2_test": 12
-  }
+  },
+  "frozen_at": "2026-11-05T04:17:23Z",
+  "git_tag": "event-script-v2"
 }
