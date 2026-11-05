@@ -4,10 +4,15 @@
 # it is frozen (step 5) — see 附录 Z for rag-framework's sign-off on the
 # schema this file follows.
 #
-# `split` is not author-assigned — it is recomputed deterministically by
+# v2 (附录 FR/FS): the 12 events below marked batch: v1 are the frozen v1 events, splits
+# inherited from git tag event-script-v1 (verify.py compares against the tag). The batch: v2
+# events are content-free slots EVT-V2-NNN; slot i is dev when i mod 3 == 1, else test.
+# The v2 test events are NOT in this file: they live in the local-only sealed file.
+#
+# `split` is not author-assigned (v1: recomputed per X.4; v2: slot rule) — it is recomputed deterministically by
 # verify.py per 附录 X.4 and must match what's recorded here.
 schema_version: "1"
-script_version: "1"
+script_version: "2"
 
 events:
   # ---------------------------------------------------------------------
@@ -17,6 +22,8 @@ events:
   - event_id: "EVT-2023-07-EAST-STOCKOUT"
     event_type: normal
     split: test
+    batch: v1
+    exposed: true
     business_description: "华东区主力型号断货,持续到八月中旬补货"
     valid_from: "2023-07-05"
     valid_to: "2023-08-14"
@@ -38,6 +45,8 @@ events:
   - event_id: "EVT-2022-11-NORTH-PROMO"
     event_type: normal
     split: test
+    batch: v1
+    exposed: true
     business_description: "北区双十一大促,Widget A 收入大幅拉升"
     valid_from: "2022-11-08"
     valid_to: "2022-11-15"
@@ -59,6 +68,8 @@ events:
   - event_id: "EVT-2023-03-SOUTH-ONLINE-POLICY"
     event_type: normal
     split: dev
+    batch: v1
+    exposed: true
     business_description: "南区线上渠道退款审核周期拉长,导致确认收入延迟"
     valid_from: "2023-03-01"
     valid_to: "2023-03-31"
@@ -76,10 +87,15 @@ events:
     probe_queries:
       - "南区线上渠道三月表现为何变差"
       - "South Online channel underperformance in March"
+    h2_probes:
+      - "2023年三月南区线上渠道表现为何变差"
+      - "South Online channel underperformance in March 2023"
 
   - event_id: "EVT-2022-06-WEST-WIDGETB-LAUNCH"
     event_type: normal
     split: dev
+    batch: v1
+    exposed: true
     business_description: "西区 Widget B 新品首发,首批渠道备货带动出货量"
     valid_from: "2022-06-01"
     valid_to: "2022-06-10"
@@ -97,10 +113,15 @@ events:
     probe_queries:
       - "西区六月出货量为何激增"
       - "West region shipment surge in early June, why"
+    h2_probes:
+      - "2022年六月西区出货量为何激增"
+      - "West region shipment surge in early June 2022, why"
 
   - event_id: "EVT-2024-01-CENTRAL-RETURN-POLICY"
     event_type: normal
     split: test
+    batch: v1
+    exposed: true
     business_description: "中区调整退货政策,部分老客户流失导致收入走低"
     valid_from: "2024-01-01"
     valid_to: "2024-01-31"
@@ -122,6 +143,8 @@ events:
   - event_id: "EVT-2023-09-EAST-PARTNER-DISPUTE"
     event_type: normal
     split: dev
+    batch: v1
+    exposed: true
     business_description: "华东合作伙伴渠道因结算纠纷暂停发货三周"
     valid_from: "2023-09-01"
     valid_to: "2023-09-21"
@@ -139,10 +162,15 @@ events:
     probe_queries:
       - "华东合作渠道九月收入为什么走低"
       - "East Partner channel revenue dip in September"
+    h2_probes:
+      - "2023年九月华东合作渠道收入为什么走低"
+      - "East Partner channel revenue dip in September 2023"
 
   - event_id: "EVT-2024-05-NORTH-GADGETPRO-EOL"
     event_type: normal
     split: dev
+    batch: v1
+    exposed: true
     business_description: "北区 Gadget Pro 停产清仓,收入明显回落"
     valid_from: "2024-05-01"
     valid_to: "2024-06-15"
@@ -160,6 +188,9 @@ events:
     probe_queries:
       - "北区五月某型号收入骤降的原因"
       - "为什么北区二季度有个产品线收入掉得厉害"
+    h2_probes:
+      - "2024年五月北区某型号收入骤降的原因"
+      - "为什么北区2024年二季度有个产品线收入掉得厉害"
 
   # ---------------------------------------------------------------------
   # distractor (3) — corpus_evidence only, no data_signal: something the
@@ -169,6 +200,8 @@ events:
   - event_id: "EVT-2023-04-SOUTH-DISCOUNT-CAMPAIGN"
     event_type: distractor
     split: dev
+    batch: v1
+    exposed: true
     business_description: "南区四月上线满减促销,但活动效果未达预期,籍此未观察到收入端的明显提升"
     valid_from: "2023-04-01"
     valid_to: "2023-04-30"
@@ -180,10 +213,15 @@ events:
     probe_queries:
       - "南区四月的促销活动带来了多少增量收入"
       - "South April discount campaign, did revenue actually move"
+    h2_probes:
+      - "2023年四月南区的促销活动带来了多少增量收入"
+      - "South April 2023 discount campaign, did revenue actually move"
 
   - event_id: "EVT-2023-12-WEST-WAREHOUSE-MOVE"
     event_type: distractor
     split: test
+    batch: v1
+    exposed: true
     business_description: "西区仓库十二月完成搬迁,团队担心会影响发货时效,但实际未造成收入波动"
     valid_from: "2023-12-01"
     valid_to: "2023-12-20"
@@ -199,6 +237,8 @@ events:
   - event_id: "EVT-2024-08-CENTRAL-PRICE-REVIEW"
     event_type: distractor
     split: dev
+    batch: v1
+    exposed: true
     business_description: "中区八月启动了一轮定价评审,讨论是否上调部分型号价格,最终未执行调价"
     valid_from: "2024-08-01"
     valid_to: "2024-08-31"
@@ -210,6 +250,9 @@ events:
     probe_queries:
       - "中区八月是否调整了产品定价"
       - "Did Central region change any product pricing in August"
+    h2_probes:
+      - "2024年八月中区是否调整了产品定价"
+      - "Did Central region change any product pricing in August 2024"
 
   # ---------------------------------------------------------------------
   # unexplained (2) — data_signal only, no corpus_evidence: a real
@@ -219,6 +262,8 @@ events:
   - event_id: "EVT-2023-Q3-GLOBAL-UNEXPLAINED-DIP"
     event_type: unexplained
     split: dev
+    batch: v1
+    exposed: true
     business_description: "2023 年三季度全网收入整体走低,幅度覆盖所有大区,语料中无任何记载"
     valid_from: "2023-07-01"
     valid_to: "2023-09-30"
@@ -231,10 +276,15 @@ events:
     probe_queries:
       - "2023年三季度全网收入为什么整体下滑"
       - "Why did overall revenue drop across every region in Q3 2023"
+    h2_probes:
+      - "2023年三季度全网收入为什么整体下滑"
+      - "Why did overall revenue drop across every region in Q3 2023"
 
   - event_id: "EVT-2024-03-SOUTH-UNITS-SPIKE"
     event_type: unexplained
     split: test
+    batch: v1
+    exposed: true
     business_description: "南区三月出货量整月维持在异常偏高的水平,语料中无任何记载"
     valid_from: "2024-03-01"
     valid_to: "2024-03-28"
@@ -248,3 +298,195 @@ events:
     probe_queries:
       - "南区三月出货量异常偏高的原因是什么"
       - "South region units stayed anomalously high through March 2024, what caused it"
+
+  # ---------------------------------------------------------------------
+  # v2 batch, dev half (6 of 18 normal events; the test half is sealed)
+  # ---------------------------------------------------------------------
+  - event_id: EVT-V2-001
+    event_type: normal
+    split: dev
+    batch: v2
+    business_description: 南区重点经销商资质到期,续签迟迟未完成,期间暂停向其供货
+    valid_from: '2022-02-23'
+    valid_to: '2022-04-05'
+    data_signal:
+      metric: revenue
+      segment:
+        region: South
+      direction: down
+      magnitude: 0.2
+      shape: step
+    corpus_evidence:
+      relevance: relevant
+      source_types:
+      - email
+      - policy_memo
+      required_facts:
+      - 经销商续约
+      - 暂停供货
+      lexical_divergence:
+      - synonym
+    probe_queries:
+    - 2022年南区二月底到四月初收入为什么走低
+    - South region revenue weakness from late February to early April 2022
+    h2_probes:
+    - 2022年春季南区销售额为什么明显下滑
+    - Why did South region revenue drop in spring 2022
+
+  - event_id: EVT-V2-004
+    event_type: normal
+    split: dev
+    batch: v2
+    business_description: 东区一家大型企业客户为用完年度预算,在年底前集中下达采购订单
+    valid_from: '2023-11-21'
+    valid_to: '2023-12-01'
+    data_signal:
+      metric: revenue
+      segment:
+        region: East
+      direction: up
+      magnitude: 0.22
+      shape: spike
+    corpus_evidence:
+      relevance: relevant
+      source_types:
+      - meeting_notes
+      required_facts:
+      - 年度预算
+      - 集中采购
+      lexical_divergence:
+      - implicit
+      - colloquial
+    probe_queries:
+    - 2023年十一月下旬东区收入为什么突然冲高
+    - East region revenue jumped briefly in late November 2023
+    h2_probes:
+    - 2023年11月底东区销售额为什么短暂大幅上升
+    - What caused the short revenue surge in the East region at the end of November 2023
+
+  - event_id: EVT-V2-007
+    event_type: normal
+    split: dev
+    batch: v2
+    business_description: 中区区域负责人离职,销售团队重组期间大客户跟进出现断档
+    valid_from: '2024-05-19'
+    valid_to: '2024-06-11'
+    data_signal:
+      metric: revenue
+      segment:
+        region: Central
+      direction: down
+      magnitude: 0.45
+      shape: ramp
+    corpus_evidence:
+      relevance: relevant
+      source_types:
+      - email
+      - meeting_notes
+      required_facts:
+      - 区域负责人离职
+      - 客户跟进断档
+      lexical_divergence:
+      - implicit
+      - synonym
+    probe_queries:
+    - 2024年五月下旬到六月初中区收入一路走低,背后有什么情况
+    - Central region revenue kept sliding from late May to early June 2024, what was going on
+    h2_probes:
+    - 2024年6月前后中区销售额持续下降是什么原因
+    - Why did Central region revenue keep falling around June 2024
+
+  - event_id: EVT-V2-010
+    event_type: normal
+    split: dev
+    batch: v2
+    business_description: 南区一家大型连锁客户与我方就账期条款产生分歧,暂缓下单一个月
+    valid_from: '2023-05-15'
+    valid_to: '2023-06-10'
+    data_signal:
+      metric: revenue
+      segment:
+        region: South
+      direction: down
+      magnitude: 0.35
+      shape: step
+    corpus_evidence:
+      relevance: relevant
+      source_types:
+      - policy_memo
+      - email
+      required_facts:
+      - 账期调整
+      - 暂缓下单
+      lexical_divergence:
+      - implicit
+      - abbreviation
+    probe_queries:
+    - 2023年五月中旬到六月上旬南区收入为什么低于往常
+    - Why was South region revenue below normal from mid May to early June 2023
+    h2_probes:
+    - 2023年5月南区销售额明显走低的原因是什么
+    - What explains the weak South region revenue in May 2023
+
+  - event_id: EVT-V2-013
+    event_type: normal
+    split: dev
+    batch: v2
+    business_description: 西区上线季度返利加码政策,渠道商为冲量提前加大进货
+    valid_from: '2022-04-09'
+    valid_to: '2022-05-05'
+    data_signal:
+      metric: revenue
+      segment:
+        region: West
+      direction: up
+      magnitude: 0.18
+      shape: step
+    corpus_evidence:
+      relevance: relevant
+      source_types:
+      - email
+      - policy_memo
+      required_facts:
+      - 返利加码
+      - 加大进货
+      lexical_divergence:
+      - synonym
+      - colloquial
+    probe_queries:
+    - 2022年四月中旬西区收入为什么明显上升
+    - West region revenue rose noticeably in April 2022, why
+    h2_probes:
+    - 2022年四五月之交西区销售额为什么明显上涨
+    - Why did West region revenue climb between April and May 2022
+
+  - event_id: EVT-V2-016
+    event_type: normal
+    split: dev
+    batch: v2
+    business_description: 北区主要竞争对手推出低价套餐,部分客户转向竞品
+    valid_from: '2024-11-29'
+    valid_to: '2024-12-24'
+    data_signal:
+      metric: revenue
+      segment:
+        region: North
+      direction: down
+      magnitude: 0.4
+      shape: ramp
+    corpus_evidence:
+      relevance: relevant
+      source_types:
+      - meeting_notes
+      - email
+      required_facts:
+      - 竞品低价套餐
+      - 客户转单
+      lexical_divergence:
+      - colloquial
+    probe_queries:
+    - 2024年十二月北区收入为什么一路下滑
+    - North region revenue kept falling through December 2024
+    h2_probes:
+    - 2024年年底北区销售额为什么持续走低
+    - Why did North region revenue trend down at the end of 2024

@@ -84,3 +84,7 @@ tests/fixtures/resume_qrels.json
 *.bak
 *.swp
 *~
+
+# ── Sealed holdout material (附录 FR.4 / FS.2): local only, never pushed ──
+eval/sealed/*
+!eval/sealed/RECEIPT.json

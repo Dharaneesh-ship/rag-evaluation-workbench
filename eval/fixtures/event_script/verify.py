@@ -58,7 +58,17 @@ if str(_ROOT) not in sys.path:
 # every split (the manifest hash is over the whole document), so it declares
 # that rather than quietly helping itself. tests/test_split_guard.py fails if
 # a second direct reader ever appears.
-from rag.eval.split_guard import load_event_script_source  # noqa: E402
+from rag.eval.split_guard import (  # noqa: E402
+    PROBE_DIGEST_LIST_PATH,
+    build_probe_digest_list,
+    load_event_script_source,
+    load_sealed_source,
+    load_v1_tag_events,
+)
+
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+import v2_checks as v2  # noqa: E402
 
 _MANIFEST_PATH = _HERE / "event_script.manifest.json"
 
@@ -484,6 +494,193 @@ def _check_detectability_and_clipping(
             )
 
 
+_SEALED_DIR = _ROOT / "eval" / "sealed"
+_PLAN_PATH = _SEALED_DIR / "slot_plan.yaml"
+_RECEIPT_PATH = _SEALED_DIR / "RECEIPT.json"
+
+
+def _run_v2(args, text: str, data: dict) -> int:
+    """Script version 2 (附录 FR/FS/FU). Prints aggregates and rule names only."""
+    import yaml
+
+    errors: list[str] = []
+    notes: dict = {}
+    public_events = data.get("events", [])
+    sealed_text, sealed = load_sealed_source(reason="verify.py v2: hash, structure and gate over the sealed test events")
+    sealed_events = sealed.get("events", []) if sealed else []
+    overlay = (sealed or {}).get("h2_overlay") or {}
+
+    _check_file_hygiene(text, errors)
+    if sealed_text:
+        sealed_errs: list[str] = []
+        _check_file_hygiene(sealed_text, sealed_errs)
+        errors.extend("sealed file: " + e for e in sealed_errs)
+    elif not args.public_only:
+        errors.append("sealed v2 test file is absent (use --public-only to check the public part alone)")
+
+    v1_events = [e for e in public_events if e.get("batch") == "v1"]
+    v2_public = [e for e in public_events if e.get("batch") == "v2"]
+    if len(v1_events) + len(v2_public) != len(public_events):
+        errors.append("every public event must carry batch: v1 or v2")
+    if [e.get("batch") for e in public_events] != ["v1"] * len(v1_events) + ["v2"] * len(v2_public):
+        errors.append("public file must list the v1 events first, then v2")
+
+    try:
+        v2.check_v1_immutable(v1_events, load_v1_tag_events(), errors)
+    except RuntimeError as exc:
+        errors.append(f"cannot inherit v1 splits: {exc}")
+
+    all_v2 = v2_public + sealed_events
+    for event in public_events + sealed_events:
+        _check_event(event, errors)
+    if len(v1_events) == 12:
+        counts = {t: sum(1 for e in v1_events if e.get("event_type") == t) for t in v2.V1_EXPECTED_TYPE_COUNTS}
+        if counts != v2.V1_EXPECTED_TYPE_COUNTS:
+            errors.append("v1 composition differs from X.3 (12/7/3/2)")
+    else:
+        errors.append(f"expected 12 v1 events, found {len(v1_events)}")
+    v2.check_h2_for_v1(v1_events, overlay, errors)
+
+    if sealed_events or not args.public_only:
+        v2.check_v2_batch(all_v2, errors)
+        v2.check_non_overlap(v1_events + all_v2, errors)
+        v2.check_region_cap(v1_events + all_v2, errors)
+    months = {e["valid_from"][:7] for e in v1_events + all_v2 if isinstance(e.get("valid_from"), str)}
+    if len(months) < _MIN_DISTINCT_MONTHS:
+        errors.append(f"events span {len(months)} distinct months, need >= {_MIN_DISTINCT_MONTHS}")
+
+    plan_sha = None
+    if _PLAN_PATH.is_file():
+        plan = yaml.safe_load(_PLAN_PATH.read_text(encoding="utf-8"))
+        plan_sha = v2.canonical_sha256(plan)
+        if sealed_events:
+            v2.check_plan_conformity(plan, all_v2, errors)
+        if _RECEIPT_PATH.is_file():
+            rec = json.loads(_RECEIPT_PATH.read_text(encoding="utf-8"))
+            if rec.get("slot_plan_sha256") != plan_sha:
+                errors.append("slot plan sha256 differs from RECEIPT.json")
+    elif not args.public_only:
+        errors.append("slot plan is absent")
+
+    pub_sha = v2.canonical_sha256(data)
+    seal_sha = v2.canonical_sha256(sealed) if sealed else None
+    type_counts = {"total": len(public_events) + len(sealed_events)}
+    for t in v2.V1_EXPECTED_TYPE_COUNTS:
+        type_counts[t] = sum(1 for e in public_events + sealed_events if e.get("event_type") == t)
+    split_counts = {"dev": 0, "test": 0, "stress": 0}
+    for e in public_events + sealed_events:
+        if e.get("split") in split_counts:
+            split_counts[e["split"]] += 1
+    h2_pool = sum(1 for e in all_v2 if e.get("split") == "test" and e.get("event_type") == "normal")
+    manifest = {
+        "schema_version": data.get("schema_version"),
+        "script_version": data.get("script_version"),
+        "canonicalization": "json-sorted-keys-utf8",
+        "sha256": pub_sha,
+        "public_sha256": pub_sha,
+        "sealed_sha256": seal_sha,
+        "combined_sha256": v2.combined_sha256(pub_sha, seal_sha) if seal_sha else None,
+        "slot_plan_sha256": plan_sha,
+        "v1_tag": "event-script-v1",
+        "frozen_at": None,
+        "git_tag": None,
+        "counts": type_counts,
+        "split_counts": split_counts,
+        "h2_pool_test_normal": h2_pool,
+    }
+
+    if args.data_path is not None:
+        rows = _load_metric_rows(args.data_path)
+        legacy_errs: list[str] = []
+        _check_detectability_and_clipping(public_events + sealed_events, rows, legacy_errs)
+        errors.extend(_redact_ids(legacy_errs, {e["event_id"] for e in sealed_events}))
+        if args.baseline_path is None:
+            errors.append("FU.2 gate needs --baseline-path (a no-event render of the same script, row for row)")
+        elif all_v2:
+            baseline = _load_metric_rows(args.baseline_path)
+            bad = v2.baseline_is_clean(rows, baseline)
+            if bad:
+                errors.append("STOP, FU.2(2) baseline not clean: " + bad)
+            else:
+                bounds = v2.revenue_bounds(rows)
+                gate = []
+                for e in all_v2:
+                    m = v2.gate_event(e, rows, baseline, bounds)
+                    z = _event_z(e, rows)
+                    if z is not None and z < v2.V2_MIN_Z_PRESCREEN:
+                        errors.append(f"{e['event_id']}: z below the v2 pre-screen {v2.V2_MIN_Z_PRESCREEN}")
+                    errors.extend(v2.gate_failures(e["event_id"], m))
+                    gate.append((m, z))
+                ratios = [m["excess_ratio"] for m, _ in gate if m["excess_ratio"] is not None]
+                notes["gate"] = {
+                    "events": len(gate),
+                    "upper_bound_used": round(bounds["upper"], 3),
+                    "upper_raw": round(bounds["raw_upper"], 3),
+                    "upper_clean": round(bounds["clean_upper"], 3),
+                    "lower_bound_reported": round(bounds["lower"], 3),
+                    "min_z": round(min(z for _, z in gate if z is not None), 2),
+                    "max_row_share_above_upper": round(max(m["row_share_above_upper"] for m, _ in gate), 4),
+                    "max_below_lower_share": round(max(m["below_lower_share"] for m, _ in gate), 4),
+                    "events_with_upward_lift": len(ratios),
+                    "excluded_rows_baseline_above_upper_total": sum(m["excluded_baseline_above_upper"] for m, _ in gate),
+                    "max_excess_ratio": round(max(ratios), 4) if ratios else None,
+                }
+
+    if errors:
+        print(f"FAIL: {len(errors)} issue(s):", file=sys.stderr)
+        for err in errors:
+            print(f"  - {err}", file=sys.stderr)
+        if notes:
+            print(json.dumps(notes, indent=2), file=sys.stderr)
+        return 1
+
+    print("PASS")
+    print(json.dumps(manifest, indent=2, ensure_ascii=False))
+    if notes:
+        print(json.dumps(notes, indent=2))
+    if args.write_receipt:
+        old = json.loads(_RECEIPT_PATH.read_text(encoding="utf-8")) if _RECEIPT_PATH.is_file() else {}
+        receipt = {
+            "status": "pre-freeze",
+            "superseded_slot_plans": old.get("superseded_slot_plans", []),
+            "script_version": "2",
+            "slot_plan_sha256": plan_sha,
+            "sealed_sha256": seal_sha,
+            "public_sha256": pub_sha,
+            "combined_sha256": manifest["combined_sha256"],
+            "counts": {"v2_dev": sum(1 for e in all_v2 if e["split"] == "dev"), "v2_test": h2_pool},
+        }
+        _RECEIPT_PATH.write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
+        print(f"Wrote {_RECEIPT_PATH}")
+    if args.write_digests and sealed:
+        listing = build_probe_digest_list(data, sealed)
+        PROBE_DIGEST_LIST_PATH.write_text(
+            json.dumps({"algorithm": "sha256(normalize_query(text))", "digests": listing}, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        print(f"Wrote {PROBE_DIGEST_LIST_PATH} ({len(listing)} digests)")
+    return 0
+
+
+def _redact_ids(msgs: list[str], sealed_ids: set[str]) -> list[str]:
+    return list(msgs)  # v2 test ids are content-free slot ids; nothing to redact
+
+
+def _event_z(event: dict, rows: list[dict[str, str]]) -> float | None:
+    ds = event.get("data_signal") or {}
+    seg = ds.get("segment") or {}
+    metric = ds.get("metric")
+    seg_rows = [r for r in rows if _segment_matches(r, seg)]
+    seg_vals = _numeric_metric_values(seg_rows, metric)
+    win = _numeric_metric_values(
+        [r for r in seg_rows if event["valid_from"] <= r["date"] <= event["valid_to"]], metric
+    )
+    if not seg_vals or not win:
+        return None
+    rel = _robust_rel_std(seg_vals)
+    return ds["magnitude"] * _SHAPE_MEAN_WEIGHT.get(ds["shape"], 0.5) * math.sqrt(len(win)) / rel if rel else math.inf
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -499,11 +696,21 @@ def main() -> int:
         "detectability + IQR-clipping gate (附录 AF.1/AF.3). Omit for the "
         "step 4/5 schema-only checks.",
     )
+    parser.add_argument("--baseline-path", type=Path, default=None,
+                        help="v2: a no-event render of the same script (FU.2(2) baseline).")
+    parser.add_argument("--public-only", action="store_true",
+                        help="v2: check the public file alone (no sealed file on this machine).")
+    parser.add_argument("--write-receipt", action="store_true",
+                        help="v2: write eval/sealed/RECEIPT.json (hashes only).")
+    parser.add_argument("--write-digests", action="store_true",
+                        help="v2: write the hash-only test probe digest list.")
     args = parser.parse_args()
 
     text, data = load_event_script_source(
         reason="verify.py structural/manifest verification of the frozen script"
     )
+    if str(data.get("script_version")) == "2":
+        return _run_v2(args, text, data)
     events = data.get("events", [])
 
     errors: list[str] = []

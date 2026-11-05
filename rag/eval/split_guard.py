@@ -71,6 +71,18 @@ _ROOT = Path(__file__).resolve().parents[2]
 #: deployment that does not ship ``eval/`` — see ``_load_document``.
 EVENT_SCRIPT_PATH = _ROOT / "eval" / "fixtures" / "event_script" / "event_script.yaml"
 
+#: v2 (附录 FR.4): the v2 test events live in a local-only, gitignored sealed
+#: file. It is never part of any tag and never pushed. Absent on a fresh clone,
+#: which is why the guard's recognition does not depend on it: see
+#: ``PROBE_DIGEST_LIST_PATH``.
+SEALED_SCRIPT_PATH = _ROOT / "eval" / "sealed" / "event_script_v2_test.yaml"
+
+#: Hash-only list of every test-split probe digest (``probe_queries`` and
+#: ``h2_probes``, public and sealed). Committed; holds no query text.
+PROBE_DIGEST_LIST_PATH = EVENT_SCRIPT_PATH.parent / "test_probe_digests.json"
+
+V1_TAG = "event-script-v1"
+
 SPLIT_DEV = "dev"
 SPLIT_TEST = "test"
 SPLIT_ALL = "all"
@@ -191,6 +203,49 @@ def load_event_script_document(*, reason: str, path: Path | str | None = None) -
     return load_event_script_source(reason=reason, path=path)[1]
 
 
+def load_sealed_source(
+    *, reason: str, path: Path | str | None = None
+) -> tuple[str, dict[str, Any]]:
+    """Return ``(raw text, parsed document)`` of the sealed v2 test file.
+
+    ``("", {})`` when the file is absent (fresh clone, packaged deployment).
+    Same declaration contract as :func:`load_event_script_source`; the only
+    in-repository readers are ``verify.py`` and the rag-side render script,
+    both of which legitimately need the test events to hash and render them.
+    """
+    if not reason or not reason.strip():
+        raise ValueError(
+            "reading the sealed v2 test file requires a non-empty reason: "
+            "reading every split has to be an explicit, attributable act."
+        )
+    resolved = (Path(path) if path is not None else SEALED_SCRIPT_PATH).resolve()
+    text = resolved.read_text(encoding="utf-8") if resolved.is_file() else ""
+    data = _load_document(resolved)
+    if text or data:
+        _print_full_document_banner(reason)
+    return text, data
+
+
+def load_v1_tag_events(*, tag: str = V1_TAG, repo: Path | str | None = None) -> list[dict[str, Any]]:
+    """Return the event list exactly as frozen at git tag ``event-script-v1``.
+
+    v2 inherits every v1 split from this tag (附录 FR.1 point 1) instead of
+    keeping a second copy of the mapping in code. Uses ``git show``; raises
+    ``RuntimeError`` when the tag or git is unavailable.
+    """
+    import subprocess
+
+    rel = EVENT_SCRIPT_PATH.relative_to(_ROOT).as_posix()
+    result = subprocess.run(
+        ["git", "-C", str(repo or _ROOT), "show", f"{tag}:{rel}"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"cannot read tag {tag!r}: {result.stderr.strip()}")
+    return (yaml.safe_load(result.stdout) or {}).get("events", [])
+
+
 def load_event_script(
     split: str = SPLIT_DEV,
     *,
@@ -236,6 +291,7 @@ def load_event_metadata(*, path: Path | str | None = None) -> list[dict[str, Any
         redacted = dict(event)
         probes = [p for p in (event.get("probe_queries") or []) if isinstance(p, str)]
         redacted.pop("probe_queries", None)
+        redacted.pop("h2_probes", None)
         redacted["probe_query_count"] = len(probes)
         redacted["probe_query_digests"] = [digest_of(p) for p in probes]
         out.append(redacted)
@@ -422,11 +478,41 @@ def digest_of(text: str) -> str:
     return hashlib.sha256(normalize_query(text).encode("utf-8")).hexdigest()
 
 
-def test_probe_query_digests(*, path: Path | str | None = None) -> frozenset[str]:
-    """Digests of every test-split probe query in the frozen event script.
+def probe_texts_of(event: dict[str, Any]) -> list[str]:
+    """Every string in an event that is a runnable probe (both fields)."""
+    out: list[str] = []
+    for field in ("probe_queries", "h2_probes"):
+        out.extend(q for q in (event.get(field) or []) if isinstance(q, str))
+    return out
 
-    Cached per path. This is the only place in the running process that ever
-    materialises test-split probe text, and it keeps none of it.
+
+def build_probe_digest_list(
+    public: dict[str, Any], sealed: dict[str, Any] | None = None
+) -> list[str]:
+    """Sorted digests of all test-split probes: public test events, sealed v2
+    test events, and the sealed ``h2_overlay`` (h2_probes of v1 test events)."""
+    digests: set[str] = set()
+    for event in public.get("events", []):
+        if event.get("split") == SPLIT_TEST:
+            digests.update(digest_of(q) for q in probe_texts_of(event))
+    sealed = sealed or {}
+    for event in sealed.get("events", []):
+        if event.get("split") == SPLIT_TEST:
+            digests.update(digest_of(q) for q in probe_texts_of(event))
+    for queries in (sealed.get("h2_overlay") or {}).values():
+        digests.update(digest_of(q) for q in queries if isinstance(q, str))
+    return sorted(digests)
+
+
+def test_probe_query_digests(*, path: Path | str | None = None) -> frozenset[str]:
+    """Digests of every test-split probe query.
+
+    Union of (a) digests computed from the public event script's test-split
+    events and (b) the committed hash-only list next to it, which also covers
+    the sealed v2 test events (so the guard bites on a machine that does not
+    hold the sealed file). Cached per path. This is the only place in the
+    running process that ever materialises test-split probe text, and it keeps
+    none of it.
     """
     resolved = _resolve_path(path).resolve()
     cached = _digest_cache.get(resolved)
@@ -437,9 +523,14 @@ def test_probe_query_digests(*, path: Path | str | None = None) -> frozenset[str
         digest_of(query)
         for event in data.get("events", [])
         if event.get("split") == SPLIT_TEST
-        for query in (event.get("probe_queries") or [])
-        if isinstance(query, str)
+        for query in probe_texts_of(event)
     }
+    list_path = resolved.parent / PROBE_DIGEST_LIST_PATH.name
+    if list_path.is_file():
+        import json as _json
+
+        listed = _json.loads(list_path.read_text(encoding="utf-8")).get("digests", [])
+        digests.update(d for d in listed if isinstance(d, str))
     frozen = frozenset(digests)
     _digest_cache[resolved] = frozen
     return frozen
