@@ -88,3 +88,6 @@ tests/fixtures/resume_qrels.json
 # ── Sealed holdout material (附录 FR.4 / FS.2): local only, never pushed ──
 eval/sealed/*
 !eval/sealed/RECEIPT.json
+
+# Rendered data deliverables (the CSV is handed over by hash, not committed)
+artifacts/g3/*.csv

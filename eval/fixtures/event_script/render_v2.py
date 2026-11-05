@@ -36,6 +36,10 @@ _ROOT = Path(__file__).resolve().parents[3]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+_ES = Path(__file__).resolve().parent
+if str(_ES) not in sys.path:
+    sys.path.insert(0, str(_ES))
+
 from rag.eval.split_guard import load_event_script_source, load_sealed_source  # noqa: E402
 
 DEFAULT_MAEDA_SCRIPTS = Path.home() / "MAEDA" / "scripts"
@@ -76,11 +80,27 @@ def _git_head(repo: Path) -> str | None:
     return res.stdout.strip() if res.returncode == 0 else None
 
 
+def _check_against_manifest(public: dict, sealed: dict) -> dict:
+    """A v2 deliverable may only be rendered from content that matches the frozen manifest."""
+    manifest = json.loads((Path(__file__).parent / "event_script.manifest.json").read_text(encoding="utf-8"))
+    if not manifest.get("git_tag"):
+        raise SystemExit("manifest is not frozen; refusing to render a v2 deliverable")
+    from v2_checks import canonical_sha256, combined_sha256
+
+    pub, seal = canonical_sha256(public), canonical_sha256(sealed)
+    if (pub, seal, combined_sha256(pub, seal)) != (
+        manifest["public_sha256"], manifest["sealed_sha256"], manifest["combined_sha256"]
+    ):
+        raise SystemExit("event content differs from the frozen manifest; refusing to render")
+    return {k: manifest[k] for k in ("git_tag", "frozen_at", "public_sha256", "sealed_sha256", "combined_sha256", "slot_plan_sha256")}
+
+
 def render(mode: str, out_dir: Path, maeda_scripts: Path) -> dict:
     refuse_forbidden_out_dir(out_dir)
     _, public = load_event_script_source(reason="render_v2.py needs every event to render the sales data")
     _, sealed = load_sealed_source(reason="render_v2.py renders the sealed test events into the data")
     events = assemble_events(mode, public.get("events", []), (sealed or {}).get("events", []))
+    frozen = _check_against_manifest(public, sealed) if mode == "v2" else None
 
     out_dir.mkdir(parents=True, exist_ok=True)
     cwd = Path.cwd()
@@ -114,6 +134,8 @@ def render(mode: str, out_dir: Path, maeda_scripts: Path) -> dict:
         "renderer_sha256": sha256_file(renderer),
         "renderer_maeda_head": _git_head(maeda_scripts.parent),
     }
+    if frozen:
+        receipt["frozen_script"] = frozen
     (out_dir / "render_receipt.json").write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
     return receipt
 

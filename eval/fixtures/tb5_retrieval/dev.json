@@ -136,5 +136,137 @@
     ],
     "notes": "[distractor] 中区八月启动了一轮定价评审,讨论是否上调部分型号价格,最终未执行调价",
     "split": "dev"
+  },
+  {
+    "query_id": "EVT-V2-001#1",
+    "query": "2022年南区二月底到四月初收入为什么走低",
+    "expected_behavior": "answer",
+    "expected_sources": [
+      "af7e4ab107c2cf52a7fd84450272e06ac14d3ae8d343dbbb4589178f094c8b12",
+      "f0d1f81b8aea2b15b3fa0beb24925f5992ae01adcc454a529ce1ad4dae5ce5e1"
+    ],
+    "notes": "[normal] 南区重点经销商资质到期,续签迟迟未完成,期间暂停向其供货",
+    "split": "dev"
+  },
+  {
+    "query_id": "EVT-V2-001#2",
+    "query": "South region revenue weakness from late February to early April 2022",
+    "expected_behavior": "answer",
+    "expected_sources": [
+      "af7e4ab107c2cf52a7fd84450272e06ac14d3ae8d343dbbb4589178f094c8b12",
+      "f0d1f81b8aea2b15b3fa0beb24925f5992ae01adcc454a529ce1ad4dae5ce5e1"
+    ],
+    "notes": "[normal] 南区重点经销商资质到期,续签迟迟未完成,期间暂停向其供货",
+    "split": "dev"
+  },
+  {
+    "query_id": "EVT-V2-004#1",
+    "query": "2023年十一月下旬东区收入为什么突然冲高",
+    "expected_behavior": "answer",
+    "expected_sources": [
+      "43db1baba4c986ebcaa4e4abd3826ddde401c8cb5326d82dac84313356f23eed",
+      "a044b2a223e2139e5fea7a82129214931141f0c1f3d87ffb43045d59b051b137"
+    ],
+    "notes": "[normal] 东区一家大型企业客户为用完年度预算,在年底前集中下达采购订单",
+    "split": "dev"
+  },
+  {
+    "query_id": "EVT-V2-004#2",
+    "query": "East region revenue jumped briefly in late November 2023",
+    "expected_behavior": "answer",
+    "expected_sources": [
+      "43db1baba4c986ebcaa4e4abd3826ddde401c8cb5326d82dac84313356f23eed",
+      "a044b2a223e2139e5fea7a82129214931141f0c1f3d87ffb43045d59b051b137"
+    ],
+    "notes": "[normal] 东区一家大型企业客户为用完年度预算,在年底前集中下达采购订单",
+    "split": "dev"
+  },
+  {
+    "query_id": "EVT-V2-007#1",
+    "query": "2024年五月下旬到六月初中区收入一路走低,背后有什么情况",
+    "expected_behavior": "answer",
+    "expected_sources": [
+      "066794d2e65e0e690f940c7cf02a477f7c837cf197304010777429093a23cb2f",
+      "fbbf14d555b9c0065044fa341c6c3b0e7a5fd34bf13edf98bb3932ef4e149633"
+    ],
+    "notes": "[normal] 中区区域负责人离职,销售团队重组期间大客户跟进出现断档",
+    "split": "dev"
+  },
+  {
+    "query_id": "EVT-V2-007#2",
+    "query": "Central region revenue kept sliding from late May to early June 2024, what was going on",
+    "expected_behavior": "answer",
+    "expected_sources": [
+      "066794d2e65e0e690f940c7cf02a477f7c837cf197304010777429093a23cb2f",
+      "fbbf14d555b9c0065044fa341c6c3b0e7a5fd34bf13edf98bb3932ef4e149633"
+    ],
+    "notes": "[normal] 中区区域负责人离职,销售团队重组期间大客户跟进出现断档",
+    "split": "dev"
+  },
+  {
+    "query_id": "EVT-V2-010#1",
+    "query": "2023年五月中旬到六月上旬南区收入为什么低于往常",
+    "expected_behavior": "answer",
+    "expected_sources": [
+      "cb6f969e40460dc4e7db3578c7ad09f1b6757d0a3708513e6f0d9784b0b79615",
+      "b03e4e156380d8b2191f829a002e4eeaa037f366aea21deb8bda7c2883ecad72"
+    ],
+    "notes": "[normal] 南区一家大型连锁客户与我方就账期条款产生分歧,暂缓下单一个月",
+    "split": "dev"
+  },
+  {
+    "query_id": "EVT-V2-010#2",
+    "query": "Why was South region revenue below normal from mid May to early June 2023",
+    "expected_behavior": "answer",
+    "expected_sources": [
+      "cb6f969e40460dc4e7db3578c7ad09f1b6757d0a3708513e6f0d9784b0b79615",
+      "b03e4e156380d8b2191f829a002e4eeaa037f366aea21deb8bda7c2883ecad72"
+    ],
+    "notes": "[normal] 南区一家大型连锁客户与我方就账期条款产生分歧,暂缓下单一个月",
+    "split": "dev"
+  },
+  {
+    "query_id": "EVT-V2-013#1",
+    "query": "2022年四月中旬西区收入为什么明显上升",
+    "expected_behavior": "answer",
+    "expected_sources": [
+      "5da2c1a06b8a1dea8ba93e6a8648066630fab59ab29109844cf96d0cfb4d0fe9",
+      "4842415f1a170acf97063a8f9fabadec1d0f7a7c08eb7679090c4f2e2f68431b"
+    ],
+    "notes": "[normal] 西区上线季度返利加码政策,渠道商为冲量提前加大进货",
+    "split": "dev"
+  },
+  {
+    "query_id": "EVT-V2-013#2",
+    "query": "West region revenue rose noticeably in April 2022, why",
+    "expected_behavior": "answer",
+    "expected_sources": [
+      "5da2c1a06b8a1dea8ba93e6a8648066630fab59ab29109844cf96d0cfb4d0fe9",
+      "4842415f1a170acf97063a8f9fabadec1d0f7a7c08eb7679090c4f2e2f68431b"
+    ],
+    "notes": "[normal] 西区上线季度返利加码政策,渠道商为冲量提前加大进货",
+    "split": "dev"
+  },
+  {
+    "query_id": "EVT-V2-016#1",
+    "query": "2024年十二月北区收入为什么一路下滑",
+    "expected_behavior": "answer",
+    "expected_sources": [
+      "57d4bc294fb28b7a33e39b06549e9235d2fee43960fb5a2c874b529a23773a4c",
+      "28340ef7550e6dcfb768bdd4fcf980e6051009d4295938d7477145b380eb6753"
+    ],
+    "notes": "[normal] 北区主要竞争对手推出低价套餐,部分客户转向竞品",
+    "split": "dev"
+  },
+  {
+    "query_id": "EVT-V2-016#2",
+    "query": "North region revenue kept falling through December 2024",
+    "expected_behavior": "answer",
+    "expected_sources": [
+      "57d4bc294fb28b7a33e39b06549e9235d2fee43960fb5a2c874b529a23773a4c",
+      "28340ef7550e6dcfb768bdd4fcf980e6051009d4295938d7477145b380eb6753"
+    ],
+    "notes": "[normal] 北区主要竞争对手推出低价套餐,部分客户转向竞品",
+    "split": "dev"
   }
 ]
