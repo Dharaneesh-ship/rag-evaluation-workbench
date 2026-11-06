@@ -539,7 +539,7 @@ def _run_v2(args, text: str, data: dict) -> int:
             errors.append("v1 composition differs from X.3 (12/7/3/2)")
     else:
         errors.append(f"expected 12 v1 events, found {len(v1_events)}")
-    v2.check_h2_for_v1(v1_events, overlay, errors)
+    v2.check_h2_for_v1(v1_events, overlay, errors, sealed_present=bool(sealed_text))
 
     if sealed_events or not args.public_only:
         v2.check_v2_batch(all_v2, errors)

@@ -35,6 +35,24 @@ suite = _load("build_suite", _ROOT / "eval" / "fixtures" / "tb5_retrieval" / "bu
 from rag.eval import split_guard as sg  # noqa: E402
 
 
+def _v1_tag_present() -> bool:
+    try:
+        sg.load_v1_tag_events()
+        return True
+    except RuntimeError:
+        return False
+
+
+def _require_v1_tag() -> None:
+    """Skip locally when the tag is missing, but never in CI: CI must fetch tags (fetch-depth: 0)."""
+    import os
+
+    if not _v1_tag_present():
+        if os.environ.get("CI"):
+            pytest.fail("tag event-script-v1 is missing in CI; the checkout must fetch tags (fetch-depth: 0)")
+        pytest.skip("tag event-script-v1 not available in this clone")
+
+
 def _ev(slot: int, *, region="North", vf="2023-02-01", vt="2023-02-20", year_in_probe="2023", **kw):
     e = {
         "event_id": f"EVT-V2-{slot:03d}",
@@ -209,10 +227,8 @@ def test_v1_test_events_may_not_carry_public_h2_probes():
 
 
 def test_real_v1_events_match_the_tag():
-    try:
-        tag_events = sg.load_v1_tag_events()
-    except RuntimeError:
-        pytest.skip("tag event-script-v1 not available")
+    _require_v1_tag()
+    tag_events = sg.load_v1_tag_events()
     pub = sg.load_event_script_document(reason="test: v1 immutability")["events"]
     errs: list[str] = []
     v2.check_v1_immutable([e for e in pub if e.get("batch") == "v1"], tag_events, errs)
@@ -415,6 +431,7 @@ def test_renderer_refuses_to_write_into_other_repositories():
 
 
 def test_verify_public_only_runs_on_this_checkout():
+    _require_v1_tag()
     res = subprocess.run(
         [sys.executable, "-B", str(_ES / "verify.py"), "--public-only"],
         capture_output=True, text=True, cwd=_ROOT,
@@ -423,6 +440,7 @@ def test_verify_public_only_runs_on_this_checkout():
 
 
 def test_verify_fails_on_a_tampered_v1_event():
+    _require_v1_tag()
     # run verify's checks directly on a mutated copy of the v1 list
     pub = sg.load_event_script_document(reason="test: tamper check")["events"]
     v1 = [dict(e) for e in pub if e.get("batch") == "v1"]
@@ -480,3 +498,12 @@ def test_pinned_renderer_hash_is_enforced(tmp_path):
         repo, render.PINNED_RENDERER_REF, render.PINNED_RENDERER_SHA256, tmp_path / "y"
     )
     assert (d / "generate_demo_data.py").is_file() and commit.startswith(render.PINNED_RENDERER_REF)
+
+
+def test_v1_test_events_need_no_overlay_when_the_sealed_file_is_absent():
+    ev = [{"event_id": "A", "split": "test", "valid_from": "2023-01-01", "valid_to": "2023-01-09"}]
+    errs: list[str] = []
+    v2.check_h2_for_v1(ev, {}, errs, sealed_present=False)
+    assert errs == []
+    v2.check_h2_for_v1(ev, {}, errs, sealed_present=True)
+    assert errs

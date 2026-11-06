@@ -216,7 +216,9 @@ def check_v2_batch(v2_events: list[dict], errors: list[str]) -> None:
             errors.append(f"v2 {half}: windows do not cover all of 2022, 2023, 2024")
 
 
-def check_h2_for_v1(public_v1: list[dict], overlay: dict[str, list], errors: list[str]) -> None:
+def check_h2_for_v1(
+    public_v1: list[dict], overlay: dict[str, list], errors: list[str], *, sealed_present: bool = True
+) -> None:
     """Every v1 event needs year-stating h2_probes: public for dev, overlay for test."""
     for ev in public_v1:
         eid = ev.get("event_id")
@@ -224,6 +226,8 @@ def check_h2_for_v1(public_v1: list[dict], overlay: dict[str, list], errors: lis
         if ev.get("split") == "test":
             if "h2_probes" in ev:
                 errors.append(f"{eid}: v1 test event must not carry h2_probes in the public file (use the sealed overlay)")
+            if not sealed_present:
+                continue  # the overlay lives in the sealed file, which this machine does not hold
             merged["h2_probes"] = overlay.get(eid)
         check_probe_years(eid, merged, "h2_probes", errors, minimum=V2_MIN_H2_PROBES)
         check_leakage_h2(eid, merged, errors)
