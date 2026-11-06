@@ -42,7 +42,14 @@ if str(_ES) not in sys.path:
 
 from rag.eval.split_guard import load_event_script_source, load_sealed_source  # noqa: E402
 
-DEFAULT_MAEDA_SCRIPTS = Path.home() / "MAEDA" / "scripts"
+DEFAULT_MAEDA_REPO = Path.home() / "MAEDA"
+DEFAULT_MAEDA_SCRIPTS = DEFAULT_MAEDA_REPO / "scripts"
+#: 附录 FZ.4: the renderer the delivered CSV was produced with. MAEDA's current
+#: HEAD no longer generates data (it receives this CSV by hash), so the renderer
+#: is read out of MAEDA's git history with ``git show`` (read-only) and pinned.
+PINNED_RENDERER_REF = "d557e52"
+PINNED_RENDERER_SHA256 = "ed223821bc709718e13650c01bd59bf71cb06a974b3040b5cf2730334451de18"
+RENDERER_PATH_IN_REPO = "scripts/generate_demo_data.py"
 FORBIDDEN_OUT_ROOTS = (Path.home() / "MAEDA", Path.home() / "agentic-data-cleaner-v2")
 
 
@@ -95,7 +102,123 @@ def _check_against_manifest(public: dict, sealed: dict) -> dict:
     return {k: manifest[k] for k in ("git_tag", "frozen_at", "public_sha256", "sealed_sha256", "combined_sha256", "slot_plan_sha256")}
 
 
-def render(mode: str, out_dir: Path, maeda_scripts: Path) -> dict:
+def materialize_pinned_renderer(maeda_repo: Path, ref: str, expected_sha256: str, into: Path) -> tuple[Path, str]:
+    """Write ``ref:scripts/generate_demo_data.py`` into ``into`` (outside any repo), verify its hash.
+
+    Returns ``(directory, full commit hash of ref)``. Nothing in the MAEDA repo is touched.
+    """
+    res = subprocess.run(
+        ["git", "-C", str(maeda_repo), "show", f"{ref}:{RENDERER_PATH_IN_REPO}"], capture_output=True
+    )
+    if res.returncode != 0:
+        raise SystemExit(f"cannot read {ref}:{RENDERER_PATH_IN_REPO}: {res.stderr.decode().strip()}")
+    got = hashlib.sha256(res.stdout).hexdigest()
+    if got != expected_sha256:
+        raise SystemExit(f"renderer at {ref} has sha256 {got}, expected {expected_sha256}")
+    into.mkdir(parents=True, exist_ok=True)
+    (into / "generate_demo_data.py").write_bytes(res.stdout)
+    commit = subprocess.run(
+        ["git", "-C", str(maeda_repo), "rev-parse", f"{ref}^{{commit}}"], capture_output=True, text=True
+    ).stdout.strip()
+    return into, commit
+
+
+def check_clean_consistency(clean_csv: Path, dirty_csv: Path) -> dict:
+    """Counts only. Relates the clean table to the quality-noise table (附录 GP.4 (2)).
+
+    Expected: the first ``len(clean)`` dirty rows equal the clean rows except for
+    revenue cells that are blank (3% missing) or exactly 10x (1% outliers); the
+    appended rows are each a duplicate of some clean row (non-revenue columns
+    equal, revenue related by the same blank / x10 rule).
+    """
+    import csv as _csv
+
+    def read(path: Path) -> list[dict]:
+        with path.open(encoding="utf-8", newline="") as f:
+            return list(_csv.DictReader(f))
+
+    def num(raw: str) -> float | None:
+        return None if raw == "" else float(raw)
+
+    clean, dirty = read(clean_csv), read(dirty_csv)
+    n = len(clean)
+    other = [c for c in clean[0] if c != "revenue"] if clean else []
+    out = {
+        "clean_rows": n,
+        "dirty_rows": len(dirty),
+        "appended_rows": len(dirty) - n,
+        "clean_blank_revenue_cells": sum(1 for r in clean if r["revenue"] == ""),
+        "head_nonrevenue_mismatches": 0,
+        "head_blank_restored": 0,
+        "head_x10_restored": 0,
+        "head_other_revenue_mismatches": 0,
+        "head_revenue_equal": 0,
+        "appended_are_duplicates_of_clean_rows": 0,
+        "appended_not_matched": 0,
+    }
+
+    def relation(d: str, c: str) -> str:
+        dv, cv = num(d), num(c)
+        if d == c:
+            return "equal"
+        if dv is None and cv is not None:
+            return "blank"
+        if dv is not None and cv is not None and dv == cv * 10:
+            return "x10"
+        return "bad"
+
+    for i in range(min(n, len(dirty))):
+        d, c = dirty[i], clean[i]
+        if any(d[k] != c[k] for k in other):
+            out["head_nonrevenue_mismatches"] += 1
+            continue
+        rel = relation(d["revenue"], c["revenue"])
+        if rel == "equal":
+            out["head_revenue_equal"] += 1
+        elif rel == "blank":
+            out["head_blank_restored"] += 1
+        elif rel == "x10":
+            out["head_x10_restored"] += 1
+        else:
+            out["head_other_revenue_mismatches"] += 1
+
+    by_key: dict[tuple, list[dict]] = {}
+    for c in clean:
+        by_key.setdefault(tuple(c[k] for k in other), []).append(c)
+    for d in dirty[n:]:
+        cands = by_key.get(tuple(d[k] for k in other), [])
+        if any(relation(d["revenue"], c["revenue"]) != "bad" for c in cands):
+            out["appended_are_duplicates_of_clean_rows"] += 1
+        else:
+            out["appended_not_matched"] += 1
+    out["consistent"] = (
+        out["head_nonrevenue_mismatches"] == 0
+        and out["head_other_revenue_mismatches"] == 0
+        and out["appended_not_matched"] == 0
+    )
+    return out
+
+
+def render(
+    mode: str,
+    out_dir: Path,
+    maeda_scripts: Path | None = None,
+    *,
+    with_clean: bool = False,
+    maeda_repo: Path = DEFAULT_MAEDA_REPO,
+) -> dict:
+    import tempfile
+
+    out_dir = out_dir.resolve()  # the renderer runs with cwd inside out_dir
+    renderer_tmp = None
+    renderer_ref = None
+    renderer_commit = None
+    if maeda_scripts is None:
+        renderer_tmp = Path(tempfile.mkdtemp(prefix="g3_renderer_"))
+        maeda_scripts, renderer_commit = materialize_pinned_renderer(
+            maeda_repo, PINNED_RENDERER_REF, PINNED_RENDERER_SHA256, renderer_tmp
+        )
+        renderer_ref = PINNED_RENDERER_REF
     refuse_forbidden_out_dir(out_dir)
     _, public = load_event_script_source(reason="render_v2.py needs every event to render the sales data")
     _, sealed = load_sealed_source(reason="render_v2.py renders the sealed test events into the data")
@@ -110,7 +233,29 @@ def render(mode: str, out_dir: Path, maeda_scripts: Path) -> dict:
     try:
         gen = importlib.import_module("generate_demo_data")
         gen.load_frozen_events = lambda: events
-        gen.generate_sales()
+        captured: dict = {}
+        if with_clean:
+            # The quality-noise block starts with df.sample(frac=0.03, random_state=1)
+            # on the untouched event-bearing table; take a copy there. The renderer
+            # file itself is not modified, so its sha256 stays the pinned one.
+            import pandas as pd
+
+            original_sample = pd.DataFrame.sample
+
+            def spy_sample(self, *a, **kw):
+                if kw.get("random_state") == 1 and "clean" not in captured:
+                    captured["clean"] = self.copy()
+                return original_sample(self, *a, **kw)
+
+            pd.DataFrame.sample = spy_sample
+        try:
+            gen.generate_sales()
+        finally:
+            if with_clean:
+                pd.DataFrame.sample = original_sample
+        if with_clean:
+            clean_df = captured["clean"]
+            clean_df.to_csv(out_dir / "sales_data_clean.csv", index=False)
     finally:
         os.chdir(cwd)
         sys.path.remove(str(maeda_scripts))
@@ -126,17 +271,39 @@ def render(mode: str, out_dir: Path, maeda_scripts: Path) -> dict:
             pass
 
     renderer = maeda_scripts / "generate_demo_data.py"
+    if renderer_ref is None:
+        renderer_commit = _git_head(maeda_scripts.parent)
     receipt = {
         "mode": mode,
         "events_rendered": len(events),
         "csv_sha256": sha256_file(target),
         "csv_rows": sum(1 for _ in target.open("rb")) - 1,
         "renderer_sha256": sha256_file(renderer),
-        "renderer_maeda_head": _git_head(maeda_scripts.parent),
+        "renderer_maeda_head": renderer_commit,
     }
+    if renderer_ref:
+        receipt["renderer_ref"] = renderer_ref
     if frozen:
         receipt["frozen_script"] = frozen
-    (out_dir / "render_receipt.json").write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
+    name = "render_receipt.json"
+    if with_clean:
+        clean_path = out_dir / "sales_data_clean.csv"
+        receipt = {
+            "kind": "clean base table: same renderer and events as csv_sha256, quality-noise block skipped",
+            **receipt,
+            "dirty_csv_sha256": receipt.pop("csv_sha256"),
+            "dirty_csv_rows": receipt.pop("csv_rows"),
+            "clean_csv": "sales_data_clean.csv",
+            "clean_csv_sha256": sha256_file(clean_path),
+            "clean_csv_rows": sum(1 for _ in clean_path.open("rb")) - 1,
+            "consistency": check_clean_consistency(clean_path, target),
+        }
+        name = "render_receipt_clean.json"
+    (out_dir / name).write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
+    if renderer_tmp is not None:
+        import shutil
+
+        shutil.rmtree(renderer_tmp, ignore_errors=True)
     return receipt
 
 
@@ -144,9 +311,13 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--mode", required=True, choices=["v1-only", "v2", "public", "baseline"])
     ap.add_argument("--out-dir", required=True, type=Path)
-    ap.add_argument("--maeda-scripts", type=Path, default=DEFAULT_MAEDA_SCRIPTS)
+    ap.add_argument("--maeda-scripts", type=Path, default=None,
+                    help="override: use this directory's generate_demo_data.py instead of the pinned "
+                         f"{PINNED_RENDERER_REF} version read out of MAEDA's git history")
+    ap.add_argument("--with-clean", action="store_true",
+                    help="also write sales_data_clean.csv (quality-noise block skipped, all events kept)")
     args = ap.parse_args()
-    print(json.dumps(render(args.mode, args.out_dir, args.maeda_scripts), indent=2))
+    print(json.dumps(render(args.mode, args.out_dir, args.maeda_scripts, with_clean=args.with_clean), indent=2))
     return 0
 
 

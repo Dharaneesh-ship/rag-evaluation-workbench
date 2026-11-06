@@ -1,0 +1,37 @@
+{
+  "kind": "clean base table: same renderer and events as csv_sha256, quality-noise block skipped",
+  "mode": "v2",
+  "events_rendered": 30,
+  "csv_sha256": "b863b60173f3c0bf30c4582738b85ba3304a7a212794d66ab14aa35dce422719",
+  "csv_rows": 48960,
+  "renderer_sha256": "ed223821bc709718e13650c01bd59bf71cb06a974b3040b5cf2730334451de18",
+  "renderer_maeda_head": "d557e52e8300c192a14a011b6828592937443d21",
+  "renderer_ref": "d557e52",
+  "frozen_script": {
+    "git_tag": "event-script-v2",
+    "frozen_at": "2026-11-05T04:17:23Z",
+    "public_sha256": "46e7f23b489e35961af33317046e073e2740b5fff9608520acce6565948f3083",
+    "sealed_sha256": "4d3eae4096a165cb763cfe614b70059233fa5ec2085ac3cc42b0767d1ed0ad9a",
+    "combined_sha256": "efc9e5acabf3a636321add28b4dc600eadc39d227aa10cadf5dc81219a97db9e",
+    "slot_plan_sha256": "359eb5ed04a9730a570dc491f2e5ed2b8f7027f046eb9cd5cc0e13eaee73dfd5"
+  },
+  "dirty_csv_sha256": "b863b60173f3c0bf30c4582738b85ba3304a7a212794d66ab14aa35dce422719",
+  "dirty_csv_rows": 48960,
+  "clean_csv": "sales_data_clean.csv",
+  "clean_csv_sha256": "6c95334422ccfefd4a3a4815944418dd995c3bcdd9513b3aa4db0be76f7d771d",
+  "clean_csv_rows": 48000,
+  "consistency": {
+    "clean_rows": 48000,
+    "dirty_rows": 48960,
+    "appended_rows": 960,
+    "clean_blank_revenue_cells": 0,
+    "head_nonrevenue_mismatches": 0,
+    "head_blank_restored": 1440,
+    "head_x10_restored": 462,
+    "head_other_revenue_mismatches": 0,
+    "head_revenue_equal": 46098,
+    "appended_are_duplicates_of_clean_rows": 960,
+    "appended_not_matched": 0,
+    "consistent": true
+  }
+}

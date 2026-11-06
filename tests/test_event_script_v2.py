@@ -430,3 +430,53 @@ def test_verify_fails_on_a_tampered_v1_event():
     errs: list[str] = []
     v2.check_v1_immutable(v1, sg.load_v1_tag_events(), errs)
     assert errs
+
+
+# ------------------------------------------------- clean base table (附录 GP)
+
+
+def _write_csv(path, rows):
+    import csv
+
+    with path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=["date", "region", "revenue", "units"])
+        w.writeheader()
+        w.writerows(rows)
+
+
+def test_clean_consistency_accepts_blank_x10_and_duplicates(tmp_path):
+    clean = [
+        {"date": "2023-01-01", "region": "N", "revenue": "10.5", "units": "1"},
+        {"date": "2023-01-02", "region": "S", "revenue": "20.0", "units": "2"},
+        {"date": "2023-01-03", "region": "E", "revenue": "30.0", "units": "3"},
+    ]
+    dirty = [dict(r) for r in clean]
+    dirty[0]["revenue"] = ""            # 3% blanking
+    dirty[1]["revenue"] = "200.0"       # 1% x10
+    dirty.append(dict(clean[2], revenue="300.0"))  # duplicate row that was also x10'd
+    _write_csv(tmp_path / "c.csv", clean)
+    _write_csv(tmp_path / "d.csv", dirty)
+    out = render.check_clean_consistency(tmp_path / "c.csv", tmp_path / "d.csv")
+    assert out["consistent"] and out["head_blank_restored"] == 1 and out["head_x10_restored"] == 1
+    assert out["appended_are_duplicates_of_clean_rows"] == 1 and out["clean_blank_revenue_cells"] == 0
+
+
+def test_clean_consistency_flags_anything_else(tmp_path):
+    clean = [{"date": "2023-01-01", "region": "N", "revenue": "10.0", "units": "1"}]
+    dirty = [dict(clean[0], revenue="11.0"), {"date": "2023-02-02", "region": "N", "revenue": "10.0", "units": "1"}]
+    _write_csv(tmp_path / "c.csv", clean)
+    _write_csv(tmp_path / "d.csv", dirty)
+    out = render.check_clean_consistency(tmp_path / "c.csv", tmp_path / "d.csv")
+    assert not out["consistent"] and out["head_other_revenue_mismatches"] == 1 and out["appended_not_matched"] == 1
+
+
+def test_pinned_renderer_hash_is_enforced(tmp_path):
+    repo = render.DEFAULT_MAEDA_REPO
+    if not (repo / ".git").exists():
+        pytest.skip("MAEDA repository not available")
+    with pytest.raises(SystemExit):
+        render.materialize_pinned_renderer(repo, render.PINNED_RENDERER_REF, "0" * 64, tmp_path / "x")
+    d, commit = render.materialize_pinned_renderer(
+        repo, render.PINNED_RENDERER_REF, render.PINNED_RENDERER_SHA256, tmp_path / "y"
+    )
+    assert (d / "generate_demo_data.py").is_file() and commit.startswith(render.PINNED_RENDERER_REF)
