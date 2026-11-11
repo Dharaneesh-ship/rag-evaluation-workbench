@@ -1157,12 +1157,18 @@ class TestVerifyAudit:
         docs = tmp_path / "corpus"
         docs.mkdir()
         ingested = docs / "in.md"
-        ingested.write_text("# In\n\nThis file was ingested properly.")
+        ingested.write_text(
+        "# In\n\nThis file was ingested properly and contains sufficient "
+        "text to pass the configured document quality gate."
+        )
         p.ingest(ingested)
         (docs / "never.md").write_text("# Never\n\nThis file was never ingested.")
 
         report = verify_directory(doc_store, docs)
-        by_name = {a.source_path.split("/")[-1]: a.status for a in report.audits}
+        by_name = {
+        a.source_path.replace("\\", "/").rsplit("/", 1)[-1]: a.status
+        for a in report.audits
+        }
         assert by_name["in.md"] == "ok"
         assert by_name["never.md"] == "missing"
         assert report.has_problems is True

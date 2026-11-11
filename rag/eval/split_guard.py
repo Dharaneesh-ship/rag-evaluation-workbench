@@ -240,6 +240,8 @@ def load_v1_tag_events(*, tag: str = V1_TAG, repo: Path | str | None = None) -> 
         ["git", "-C", str(repo or _ROOT), "show", f"{tag}:{rel}"],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
     )
     if result.returncode != 0:
         raise RuntimeError(f"cannot read tag {tag!r}: {result.stderr.strip()}")

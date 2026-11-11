@@ -84,13 +84,13 @@ class BasicAnswerComposer:
         Returns:
             A ``(Answer, AnswerTrace)`` tuple.
         """
-        pipeline_start = time.monotonic()
+        pipeline_start = time.perf_counter()
         steps: list[PipelineStep] = []
 
         # ── Step 1: Pack context ──────────────────────────────────────────────
-        t0 = time.monotonic()
+        t0 = time.perf_counter()
         packed: PackedContext = self._packer.pack(candidates)
-        pack_ms = (time.monotonic() - t0) * 1000
+        pack_ms = (time.perf_counter() - t0) * 1000
         steps.append(
             PipelineStep(
                 step_name="context_pack",
@@ -105,9 +105,9 @@ class BasicAnswerComposer:
         )
 
         # ── Step 2: Build prompt ─────────────────────────────────────────────
-        t0 = time.monotonic()
+        t0 = time.perf_counter()
         built_prompt = self._prompt_builder.build(query, packed)
-        prompt_ms = (time.monotonic() - t0) * 1000
+        prompt_ms = (time.perf_counter() - t0) * 1000
         steps.append(
             PipelineStep(
                 step_name="prompt_build",
@@ -118,13 +118,13 @@ class BasicAnswerComposer:
         )
 
         # ── Step 3: LLM generate ─────────────────────────────────────────────
-        t0 = time.monotonic()
+        t0 = time.perf_counter()
         llm_response = self._llm.generate(
             built_prompt.user,
             # Pass system as a kwarg so OpenAI-style clients can use it;
             # BaseLLMClient.generate accepts **kwargs for flexibility.
         )
-        llm_ms = (time.monotonic() - t0) * 1000
+        llm_ms = (time.perf_counter() - t0) * 1000
         steps.append(
             PipelineStep(
                 step_name="llm_generate",
@@ -148,7 +148,7 @@ class BasicAnswerComposer:
         used_citations = self._filter_cited(packed.citations, answer_text)
         spans = self._build_spans(answer_text)
 
-        total_ms = (time.monotonic() - pipeline_start) * 1000
+        total_ms = (time.perf_counter() - pipeline_start) * 1000
 
         # ── Assemble outputs ─────────────────────────────────────────────────
         answer = Answer(

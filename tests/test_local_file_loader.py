@@ -17,7 +17,7 @@ def loader():
 @pytest.fixture
 def sample_txt(tmp_path):
     f = tmp_path / "sample.txt"
-    f.write_text("Hello, RAG framework!\nLine two.", encoding="utf-8")
+    f.write_bytes("Hello, RAG framework!\nLine two.".encode("utf-8"))
     return f
 
 
