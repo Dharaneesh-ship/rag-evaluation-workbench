@@ -6,6 +6,54 @@ A modular, pluggable Retrieval-Augmented Generation (RAG) framework with hybrid 
 
 ---
 
+## RAG Evaluation & Optimization Workbench — Additional Contributions
+
+This fork extends the original [RAG Framework](https://github.com/UrBaneee/rag-framework) with additional capabilities focused on local LLM integration, reproducible retrieval experiments, and evaluation analysis.
+
+### Key Contributions
+
+- **Local Ollama Integration:** Added an Ollama LLM client supporting locally hosted models, configurable generation parameters, structured JSON output, token usage reporting, and latency measurement.
+- **Config-Driven Experiment Runner:** Introduced YAML-based experiment configurations to execute and compare multiple retrieval experiments reproducibly.
+- **Retrieval Ablation Studies:** Implemented controlled BM25 retrieval experiments using different Top-K configurations.
+- **Evaluation Metrics:** Integrated reporting of Recall@K, Mean Reciprocal Rank (MRR), nDCG@K, and query latency.
+- **Experiment Result Export:** Added JSON and CSV export for experiment results.
+- **Experiment Comparison Dashboard:** Developed an additional Streamlit page to filter experiment runs, compare retrieval metrics, inspect experiment configurations, and download comparison results.
+
+### Experimental Results
+
+Initial evaluation using the TB5 retrieval development split:
+
+| Configuration | Recall@10 | MRR | nDCG@10 | Latency (ms) |
+|---|---:|---:|---:|---:|
+| BM25 Top-10 | 0.5486 | 0.4230 | 0.4287 | 35.39 |
+| BM25 Top-5 | 0.3889 | 0.4063 | 0.3604 | 36.27 |
+| BM25 Top-20 | 0.5486 | 0.4230 | 0.4287 | 34.99 |
+
+**Key observations:**
+
+- BM25 Top-5 produced lower Recall@10 and nDCG@10 than the other configurations.
+- BM25 Top-10 and Top-20 achieved identical measured retrieval quality.
+- Top-10 is a reasonable default for this evaluation dataset, avoiding additional retrieval candidates without sacrificing measured quality.
+
+### Experiment Comparison Dashboard
+
+The dashboard provides a consolidated view of experiment results, including retrieval metrics, query latency, configuration details, and CSV export.
+
+### Validation
+
+- Automated test suite: **1,439 passed, 1 skipped**.
+- Local Ollama integration tested successfully.
+- Experiment configurations executed and results persisted in JSON and CSV formats.
+- Streamlit experiment comparison dashboard implemented and visually verified.
+
+### Attribution
+
+These are additional contributions made in this fork. The original RAG framework, its underlying architecture, and existing implementations remain attributed to their respective upstream authors.
+
+Original repository: [UrBaneee/rag-framework](https://github.com/UrBaneee/rag-framework)
+
+---
+
 ## Why this project exists
 
 Most RAG tutorials wire together a vector store and an LLM call and stop there.
