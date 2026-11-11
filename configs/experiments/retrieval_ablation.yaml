@@ -1,0 +1,22 @@
+suite: ../../eval/fixtures/tb5_retrieval/dev.json
+db: ../../data/workbench.db
+index_dir: ../../data/default_indexes
+
+split: dev
+k: 10
+
+experiments:
+  - name: bm25_baseline_top10
+    top_k: 10
+    embedding_provider: none
+    reranker_provider: none
+
+  - name: bm25_top5
+    top_k: 5
+    embedding_provider: none
+    reranker_provider: none
+
+  - name: bm25_top20
+    top_k: 20
+    embedding_provider: none
+    reranker_provider: none
